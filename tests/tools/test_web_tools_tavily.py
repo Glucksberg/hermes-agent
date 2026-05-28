@@ -13,6 +13,8 @@ import asyncio
 import pytest
 from unittest.mock import patch, MagicMock
 
+from tests.tools.conftest import register_all_web_providers
+
 
 # ─── _tavily_request ─────────────────────────────────────────────────────────
 
@@ -163,6 +165,15 @@ class TestNormalizeTavilyDocuments:
 class TestWebSearchTavily:
     """Test web_search_tool dispatch to Tavily."""
 
+    _register_providers = staticmethod(register_all_web_providers)
+
+    @pytest.fixture(autouse=True)
+    def _populate_web_registry(self):
+        self._register_providers()
+        yield
+        from agent.web_search_registry import _reset_for_tests
+        _reset_for_tests()
+
     def test_search_dispatches_to_tavily(self):
         mock_response = MagicMock()
         mock_response.json.return_value = {
@@ -185,6 +196,15 @@ class TestWebSearchTavily:
 
 class TestWebExtractTavily:
     """Test web_extract_tool dispatch to Tavily."""
+
+    _register_providers = staticmethod(register_all_web_providers)
+
+    @pytest.fixture(autouse=True)
+    def _populate_web_registry(self):
+        self._register_providers()
+        yield
+        from agent.web_search_registry import _reset_for_tests
+        _reset_for_tests()
 
     def test_extract_dispatches_to_tavily(self):
         mock_response = MagicMock()
@@ -211,6 +231,15 @@ class TestWebExtractTavily:
 class TestWebCrawlTavily:
     """Test web_crawl_tool dispatch to Tavily."""
 
+    _register_providers = staticmethod(register_all_web_providers)
+
+    @pytest.fixture(autouse=True)
+    def _populate_web_registry(self):
+        self._register_providers()
+        yield
+        from agent.web_search_registry import _reset_for_tests
+        _reset_for_tests()
+
     def test_crawl_dispatches_to_tavily(self):
         mock_response = MagicMock()
         mock_response.json.return_value = {
@@ -225,6 +254,7 @@ class TestWebCrawlTavily:
              patch.dict(os.environ, {"TAVILY_API_KEY": "tvly-test"}), \
              patch("tools.web_tools.httpx.post", return_value=mock_response), \
              patch("tools.web_tools.check_website_access", return_value=None), \
+             patch("tools.web_tools.is_safe_url", return_value=True), \
              patch("tools.interrupt.is_interrupted", return_value=False):
             from tools.web_tools import web_crawl_tool
             result = json.loads(asyncio.get_event_loop().run_until_complete(
@@ -244,6 +274,7 @@ class TestWebCrawlTavily:
              patch.dict(os.environ, {"TAVILY_API_KEY": "tvly-test"}), \
              patch("tools.web_tools.httpx.post", return_value=mock_response) as mock_post, \
              patch("tools.web_tools.check_website_access", return_value=None), \
+             patch("tools.web_tools.is_safe_url", return_value=True), \
              patch("tools.interrupt.is_interrupted", return_value=False):
             from tools.web_tools import web_crawl_tool
             asyncio.get_event_loop().run_until_complete(

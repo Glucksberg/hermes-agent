@@ -12,8 +12,7 @@ import logging
 from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Any, Union
-from enum import Enum
+from typing import Dict, List, Optional, Any
 
 from hermes_cli.config import get_hermes_home
 
@@ -24,6 +23,44 @@ TRUNCATED_VISIBLE = 3800
 
 from .config import Platform, GatewayConfig
 from .session import SessionSource
+
+
+def _looks_like_telegram_private_chat_id(chat_id: Optional[str]) -> bool:
+    if chat_id is None:
+        return False
+    try:
+        return int(chat_id) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _looks_like_int(value: Optional[str]) -> bool:
+    if value is None:
+        return False
+    try:
+        int(value)
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
+def _send_result_failed(result: Any) -> bool:
+    if isinstance(result, dict):
+        return result.get("success") is False
+    return getattr(result, "success", True) is False
+
+
+def _send_result_error(result: Any) -> Optional[str]:
+    if isinstance(result, dict):
+        error = result.get("error")
+    else:
+        error = getattr(result, "error", None)
+    return str(error) if error else None
+
+
+def _is_thread_not_found_delivery_error(result: Any) -> bool:
+    error = _send_result_error(result)
+    return bool(error and "thread not found" in error.lower())
 
 
 @dataclass
@@ -54,9 +91,10 @@ class DeliveryTarget:
         - "telegram" → Telegram home channel
         - "telegram:123456" → specific Telegram chat
         """
-        target = target.strip().lower()
+        target_stripped = target.strip()
+        target_lower = target_stripped.lower()
         
-        if target == "origin":
+        if target_lower == "origin":
             if origin:
                 return cls(
                     platform=origin.platform,
@@ -68,22 +106,26 @@ class DeliveryTarget:
                 # Fallback to local if no origin
                 return cls(platform=Platform.LOCAL, is_origin=True)
         
-        if target == "local":
+        if target_lower == "local":
             return cls(platform=Platform.LOCAL)
         
-        # Check for platform:chat_id format
-        if ":" in target:
-            platform_str, chat_id = target.split(":", 1)
+        # Check for platform:chat_id or platform:chat_id:thread_id format
+        # Use the original case for chat_id/thread_id to preserve case-sensitive IDs
+        if ":" in target_stripped:
+            parts = target_stripped.split(":", 2)
+            platform_str = parts[0].lower()  # Platform names are case-insensitive
+            chat_id = parts[1] if len(parts) > 1 else None
+            thread_id = parts[2] if len(parts) > 2 else None
             try:
                 platform = Platform(platform_str)
-                return cls(platform=platform, chat_id=chat_id, is_explicit=True)
+                return cls(platform=platform, chat_id=chat_id, thread_id=thread_id, is_explicit=True)
             except ValueError:
                 # Unknown platform, treat as local
                 return cls(platform=Platform.LOCAL)
         
         # Just a platform name (use home channel)
         try:
-            platform = Platform(target)
+            platform = Platform(target_lower)
             return cls(platform=platform)
         except ValueError:
             # Unknown platform, treat as local
@@ -95,6 +137,8 @@ class DeliveryTarget:
             return "origin"
         if self.platform == Platform.LOCAL:
             return "local"
+        if self.chat_id and self.thread_id:
+            return f"{self.platform.value}:{self.chat_id}:{self.thread_id}"
         if self.chat_id:
             return f"{self.platform.value}:{self.chat_id}"
         return self.platform.value
@@ -119,53 +163,6 @@ class DeliveryRouter:
         self.config = config
         self.adapters = adapters or {}
         self.output_dir = get_hermes_home() / "cron" / "output"
-    
-    def resolve_targets(
-        self,
-        deliver: Union[str, List[str]],
-        origin: Optional[SessionSource] = None
-    ) -> List[DeliveryTarget]:
-        """
-        Resolve delivery specification to concrete targets.
-        
-        Args:
-            deliver: Delivery spec - "origin", "telegram", ["local", "discord"], etc.
-            origin: The source where the request originated (for "origin" target)
-        
-        Returns:
-            List of resolved delivery targets
-        """
-        if isinstance(deliver, str):
-            deliver = [deliver]
-        
-        targets = []
-        seen_platforms = set()
-        
-        for target_str in deliver:
-            target = DeliveryTarget.parse(target_str, origin)
-            
-            # Resolve home channel if needed
-            if target.chat_id is None and target.platform != Platform.LOCAL:
-                home = self.config.get_home_channel(target.platform)
-                if home:
-                    target.chat_id = home.chat_id
-                else:
-                    # No home channel configured, skip this platform
-                    continue
-            
-            # Deduplicate
-            key = (target.platform, target.chat_id, target.thread_id)
-            if key not in seen_platforms:
-                seen_platforms.add(key)
-                targets.append(target)
-        
-        # Always include local if configured
-        if self.config.always_log_local:
-            local_key = (Platform.LOCAL, None, None)
-            if local_key not in seen_platforms:
-                targets.append(DeliveryTarget(platform=Platform.LOCAL))
-        
-        return targets
     
     async def deliver(
         self,
@@ -290,58 +287,86 @@ class DeliveryRouter:
             )
         
         send_metadata = dict(metadata or {})
-        if target.thread_id and "thread_id" not in send_metadata:
-            send_metadata["thread_id"] = target.thread_id
-        return await adapter.send(target.chat_id, content, metadata=send_metadata or None)
+        is_named_telegram_private_topic = False
+        named_telegram_private_topic_name: Optional[str] = None
+        if target.thread_id:
+            has_explicit_direct_topic = (
+                "direct_messages_topic_id" in send_metadata
+                or "telegram_direct_messages_topic_id" in send_metadata
+            )
+            target_thread_id = target.thread_id
+            is_named_telegram_private_topic = (
+                target.platform == Platform.TELEGRAM
+                and _looks_like_telegram_private_chat_id(target.chat_id)
+                and not _looks_like_int(target_thread_id)
+                and "thread_id" not in send_metadata
+                and "message_thread_id" not in send_metadata
+                and not has_explicit_direct_topic
+            )
+            if is_named_telegram_private_topic:
+                named_telegram_private_topic_name = target_thread_id
+                ensure_dm_topic = getattr(adapter, "ensure_dm_topic", None)
+                if ensure_dm_topic is None:
+                    raise RuntimeError(
+                        "Telegram adapter cannot create named private DM topics"
+                    )
+                created_thread_id = await ensure_dm_topic(target.chat_id, target_thread_id)
+                if not created_thread_id:
+                    raise RuntimeError(
+                        f"Failed to create Telegram private DM topic '{target_thread_id}'"
+                    )
+                target_thread_id = str(created_thread_id)
+                send_metadata["thread_id"] = target_thread_id
+                send_metadata["telegram_dm_topic_created_for_send"] = True
+            elif (
+                target.platform == Platform.TELEGRAM
+                and _looks_like_telegram_private_chat_id(target.chat_id)
+                and "thread_id" not in send_metadata
+                and "message_thread_id" not in send_metadata
+                and not has_explicit_direct_topic
+            ):
+                # Legacy private topic/thread ids that were not created by this
+                # send path may still need a reply anchor to stay visible in the
+                # requested lane. Named targets are created above via
+                # createForumTopic and can use message_thread_id directly.
+                reply_anchor = send_metadata.get("telegram_reply_to_message_id")
+                if reply_anchor is None:
+                    raise RuntimeError(
+                        "Telegram private DM topic delivery requires telegram_reply_to_message_id; "
+                        "send to the bare chat or provide a reply anchor"
+                    )
+                send_metadata["thread_id"] = target_thread_id
+                send_metadata["telegram_dm_topic_reply_fallback"] = True
+            elif "thread_id" not in send_metadata and "message_thread_id" not in send_metadata and not has_explicit_direct_topic:
+                send_metadata["thread_id"] = target_thread_id
+        result = await adapter.send(target.chat_id, content, metadata=send_metadata or None)
+        if _send_result_failed(result):
+            if (
+                is_named_telegram_private_topic
+                and named_telegram_private_topic_name
+                and _is_thread_not_found_delivery_error(result)
+            ):
+                ensure_dm_topic = getattr(adapter, "ensure_dm_topic", None)
+                if ensure_dm_topic is None:
+                    raise RuntimeError(
+                        "Telegram adapter cannot refresh named private DM topics"
+                    )
+                refreshed_thread_id = await ensure_dm_topic(
+                    target.chat_id,
+                    named_telegram_private_topic_name,
+                    force_create=True,
+                )
+                if not refreshed_thread_id:
+                    raise RuntimeError(
+                        f"Failed to refresh Telegram private DM topic '{named_telegram_private_topic_name}'"
+                    )
+                send_metadata["thread_id"] = str(refreshed_thread_id)
+                send_metadata["telegram_dm_topic_created_for_send"] = True
+                result = await adapter.send(target.chat_id, content, metadata=send_metadata or None)
+            if _send_result_failed(result):
+                raise RuntimeError(_send_result_error(result) or f"{target.platform.value} delivery failed")
+        return result
 
 
-def parse_deliver_spec(
-    deliver: Optional[Union[str, List[str]]],
-    origin: Optional[SessionSource] = None,
-    default: str = "origin"
-) -> Union[str, List[str]]:
-    """
-    Normalize a delivery specification.
-    
-    If None or empty, returns the default.
-    """
-    if not deliver:
-        return default
-    return deliver
 
 
-def build_delivery_context_for_tool(
-    config: GatewayConfig,
-    origin: Optional[SessionSource] = None
-) -> Dict[str, Any]:
-    """
-    Build context for the unified cronjob tool to understand delivery options.
-    
-    This is passed to the tool so it can validate and explain delivery targets.
-    """
-    connected = config.get_connected_platforms()
-    
-    options = {
-        "origin": {
-            "description": "Back to where this job was created",
-            "available": origin is not None,
-        },
-        "local": {
-            "description": "Save to local files only",
-            "available": True,
-        }
-    }
-    
-    for platform in connected:
-        home = config.get_home_channel(platform)
-        options[platform.value] = {
-            "description": f"{platform.value.title()} home channel",
-            "available": True,
-            "home_channel": home.to_dict() if home else None,
-        }
-    
-    return {
-        "origin": origin.to_dict() if origin else None,
-        "options": options,
-        "always_log_local": config.always_log_local,
-    }
