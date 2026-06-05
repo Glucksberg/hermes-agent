@@ -71,6 +71,25 @@ def _patch_managed_uv(request):
         yield
 
 
+@pytest.fixture(autouse=True)
+def _skip_update_venv_reexec():
+    """Keep existing cmd_update tests focused on update behavior, not exec()."""
+    with patch("hermes_cli.main._maybe_reexec_update_in_managed_venv", return_value=False):
+        yield
+
+
+def test_cmd_update_does_not_reexec_for_non_git_installs(mock_args):
+    from hermes_cli import main as hm
+
+    with patch("hermes_cli.config.detect_install_method", return_value="pip"), patch.object(
+        hm, "_maybe_reexec_update_in_managed_venv"
+    ) as maybe_reexec, patch.object(hm, "_cmd_update_impl") as update_impl:
+        cmd_update(mock_args)
+
+    maybe_reexec.assert_not_called()
+    update_impl.assert_called_once_with(mock_args, gateway_mode=False)
+
+
 class TestCmdUpdateNpmLockfileCache:
     @staticmethod
     def _cache_file(hermes_root, project_root):
