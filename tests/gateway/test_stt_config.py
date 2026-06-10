@@ -95,3 +95,176 @@ async def test_enrich_message_with_transcription_guards_empty_transcript():
     assert transcripts == []
 
 
+@pytest.mark.asyncio
+async def test_prepare_inbound_message_text_transcribes_queued_voice_event():
+    from gateway.run import GatewayRunner
+
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner.config = GatewayConfig(stt_enabled=True)
+    runner.adapters = {}
+    runner._model = "test-model"
+    runner._base_url = ""
+    runner._has_setup_skill = lambda: False
+
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="123",
+        chat_type="dm",
+    )
+    event = MessageEvent(
+        text="",
+        message_type=MessageType.VOICE,
+        source=source,
+        media_urls=["/tmp/queued-voice.ogg"],
+        media_types=["audio/ogg"],
+    )
+
+    with patch(
+        "tools.transcription_tools.transcribe_audio",
+        return_value={
+            "success": True,
+            "transcript": "queued voice transcript",
+            "provider": "local_command",
+        },
+    ):
+        result = await runner._prepare_inbound_message_text(
+            event=event,
+            source=source,
+            history=[],
+        )
+
+    assert result is not None
+    # Success path: the transcript passes through as a plain quoted line, with
+    # no "voice message" meta-commentary that the LLM would echo back.
+    assert "queued voice transcript" in result
+
+
+@pytest.mark.asyncio
+async def test_observed_audio_context_transcribes_on_addressed_followup(tmp_path):
+    from gateway.run import GatewayRunner
+
+    audio_path = tmp_path / "audio_123.ogg"
+    audio_path.write_bytes(b"fake ogg bytes")
+
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner.config = GatewayConfig(stt_enabled=True)
+
+    history = [
+        {
+            "role": "user",
+            "observed": True,
+            "content": f"[Alice|111]\n[audio 'voice.ogg' saved at: {audio_path}]",
+        },
+        {"role": "assistant", "content": "previous reply"},
+    ]
+
+    with patch("gateway.run._resolve_observed_audio_cache_path", return_value=str(audio_path.resolve())), patch(
+        "tools.transcription_tools.transcribe_audio",
+        return_value={
+            "success": True,
+            "transcript": "observed voice transcript",
+            "provider": "openai",
+        },
+    ) as transcribe:
+        enriched = await runner._enrich_observed_audio_context(
+            history,
+            channel_prompt="observed Telegram group context",
+            current_message="[Bob|222]\nconsegue acessar esse audio?",
+        )
+
+    transcribe.assert_called_once_with(str(audio_path.resolve()))
+    assert enriched[0] is not history[0]
+    assert "Observed audio transcript" in enriched[0]["content"]
+    assert "observed voice transcript" in enriched[0]["content"]
+    assert enriched[0]["_observed_audio_transcripts"] == ["observed voice transcript"]
+    assert enriched[1] is history[1]
+
+
+@pytest.mark.asyncio
+async def test_observed_audio_context_only_runs_for_telegram_observe_prompt(tmp_path):
+    from gateway.run import GatewayRunner
+
+    audio_path = tmp_path / "audio_123.ogg"
+    audio_path.write_bytes(b"fake ogg bytes")
+
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner.config = GatewayConfig(stt_enabled=True)
+    history = [
+        {
+            "role": "user",
+            "observed": True,
+            "content": f"[Alice|111]\n[audio 'voice.ogg' saved at: {audio_path}]",
+        },
+    ]
+
+    with patch(
+        "tools.transcription_tools.transcribe_audio",
+        side_effect=AssertionError("observed audio should not be transcribed"),
+    ):
+        enriched = await runner._enrich_observed_audio_context(
+            history,
+            channel_prompt=None,
+            current_message="[Bob|222]\nconsegue acessar esse audio?",
+        )
+
+    assert enriched is history
+
+
+@pytest.mark.asyncio
+async def test_observed_audio_context_waits_for_audio_request(tmp_path):
+    from gateway.run import GatewayRunner
+
+    audio_path = tmp_path / "audio_123.ogg"
+    audio_path.write_bytes(b"fake ogg bytes")
+
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner.config = GatewayConfig(stt_enabled=True)
+    history = [
+        {
+            "role": "user",
+            "observed": True,
+            "content": f"[Alice|111]\n[audio 'voice.ogg' saved at: {audio_path}]",
+        },
+    ]
+
+    with patch(
+        "tools.transcription_tools.transcribe_audio",
+        side_effect=AssertionError("observed audio should wait for an audio request"),
+    ):
+        enriched = await runner._enrich_observed_audio_context(
+            history,
+            channel_prompt="observed Telegram group context",
+            current_message="[Bob|222]\nbom dia",
+        )
+
+    assert enriched is history
+
+
+def test_observed_audio_cache_path_resolves_agent_visible_docker_path(tmp_path):
+    from gateway.run import _resolve_observed_audio_cache_path
+
+    host_audio_dir = tmp_path / "cache" / "audio"
+    host_audio_dir.mkdir(parents=True)
+    host_audio = host_audio_dir / "audio_123.ogg"
+    host_audio.write_bytes(b"fake ogg bytes")
+
+    with patch(
+        "gateway.platforms.base.get_audio_cache_dir",
+        return_value=host_audio_dir,
+    ), patch(
+        "hermes_constants.get_hermes_home",
+        return_value=tmp_path,
+    ), patch(
+        "tools.credential_files.get_cache_directory_mounts",
+        return_value=[
+            {
+                "host_path": str(host_audio_dir),
+                "container_path": "/root/.hermes/cache/audio",
+            }
+        ],
+    ):
+        resolved = _resolve_observed_audio_cache_path(
+            "/root/.hermes/cache/audio/audio_123.ogg"
+        )
+
+    assert resolved == str(host_audio.resolve())
