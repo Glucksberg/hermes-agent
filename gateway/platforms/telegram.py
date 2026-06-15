@@ -5039,6 +5039,62 @@ class TelegramAdapter(BasePlatformAdapter):
             return note
         return f"{existing}\n\n{note}"
 
+    async def _cache_replied_audio_media(self, msg: Message, event: MessageEvent) -> MessageEvent:
+        """Expose replied-to Telegram voice/audio as current-turn context.
+
+        Telegram reply metadata gives us the original message object, but
+        _build_message_event can only copy text/captions synchronously.  When a
+        user addresses the bot by replying to a voice note, cache that referenced
+        audio and attach it to the event so the normal STT path transcribes it.
+        """
+        reply_msg = getattr(msg, "reply_to_message", None)
+        if not reply_msg:
+            return event
+
+        source, filename, mime, kind = self._observed_media_source(reply_msg)
+        if source is None or kind != "audio":
+            return event
+
+        max_bytes = getattr(self, "_max_doc_bytes", 20 * 1024 * 1024)
+        file_size = getattr(source, "file_size", None)
+        try:
+            size = int(file_size or 0)
+        except (TypeError, ValueError):
+            size = 0
+        if not (0 < size <= max_bytes):
+            limit_mb = max_bytes // (1024 * 1024)
+            event.reply_to_text = self._append_observed_note(
+                event.reply_to_text,
+                f"[Replied-to Telegram audio too large or unverifiable. Maximum: {limit_mb} MB.]",
+            )
+            logger.info("[Telegram] Replied-to audio skipped (size=%s)", file_size)
+            return event
+
+        try:
+            from gateway.platforms.base import cache_media_bytes
+
+            file_obj = await source.get_file()
+            data = bytes(await file_obj.download_as_bytearray())
+            if not filename:
+                filename = os.path.basename(getattr(file_obj, "file_path", "") or "")
+            cached = cache_media_bytes(data, filename=filename, mime_type=mime, default_kind=kind)
+        except Exception as exc:
+            logger.warning("[Telegram] Failed to cache replied-to audio: %s", exc, exc_info=True)
+            return event
+
+        if cached is None or cached.kind != "audio":
+            event.reply_to_text = self._append_observed_note(
+                event.reply_to_text,
+                "[Replied-to Telegram audio: unsupported type, not cached.]",
+            )
+            return event
+
+        event.reply_to_text = self._append_observed_note(event.reply_to_text, cached.context_note())
+        event.media_urls.append(cached.path)
+        event.media_types.append(cached.media_type)
+        logger.info("[Telegram] Cached replied-to audio at %s", cached.path)
+        return event
+
     def _observe_unmentioned_group_message(
         self,
         message: Message,
@@ -5204,6 +5260,7 @@ class TelegramAdapter(BasePlatformAdapter):
         await self._ensure_forum_commands(update.message)
 
         event = self._build_message_event(msg, MessageType.TEXT, update_id=update.update_id)
+        event = await self._cache_replied_audio_media(msg, event)
         event.text = self._clean_bot_trigger_text(event.text)
         event = self._apply_telegram_group_observe_attribution(event)
         self._enqueue_text_event(event)
@@ -5218,6 +5275,7 @@ class TelegramAdapter(BasePlatformAdapter):
         await self._ensure_forum_commands(msg)
 
         event = self._build_message_event(msg, MessageType.COMMAND, update_id=update.update_id)
+        event = await self._cache_replied_audio_media(msg, event)
         event.text = self._clean_bot_trigger_text(event.text)
         event = self._apply_telegram_group_observe_attribution(event)
         await self.handle_message(event)
@@ -5258,6 +5316,7 @@ class TelegramAdapter(BasePlatformAdapter):
         parts.append("Ask what they'd like to find nearby (restaurants, cafes, etc.) and any preferences.")
 
         event = self._build_message_event(msg, MessageType.LOCATION, update_id=update.update_id)
+        event = await self._cache_replied_audio_media(msg, event)
         event.text = "\n".join(parts)
         event = self._apply_telegram_group_observe_attribution(event)
         await self.handle_message(event)
@@ -5427,6 +5486,7 @@ class TelegramAdapter(BasePlatformAdapter):
         msg_type = self._media_message_type(msg)
 
         event = self._build_message_event(msg, msg_type, update_id=update.update_id)
+        event = await self._cache_replied_audio_media(msg, event)
         
         # Add caption as text
         if msg.caption:
