@@ -147,6 +147,11 @@ SCHEMA_VERSION = 21
 # sanitizer/runtime behavior predictable under adversarial input.
 MAX_FTS5_QUERY_CHARS = 2_048
 
+# Observed gateway messages bypass model-generated compression summaries, so
+# retaining them without a bound can rebuild an oversized live context after
+# compaction. Apply one global cap to both in-place and split-session flows.
+MAX_OBSERVED_CONTEXT_MESSAGES = 50
+
 # ---------------------------------------------------------------------------
 # WAL-compatibility fallback
 # ---------------------------------------------------------------------------
@@ -4039,12 +4044,31 @@ class SessionDB:
 
         def _do(conn):
             observed_rows = conn.execute(
-                "SELECT role, content, timestamp, platform_message_id "
-                "FROM messages WHERE session_id = ? AND active = 1 "
-                "AND observed = 1 ORDER BY id",
-                (session_id,),
+                "SELECT role, content, timestamp, platform_message_id FROM ("
+                "  SELECT id AS message_row_id, role, content, timestamp, "
+                "         platform_message_id "
+                "  FROM messages WHERE session_id = ? AND active = 1 "
+                "    AND observed = 1 "
+                "  ORDER BY id DESC LIMIT ?"
+                ") ORDER BY message_row_id",
+                (session_id, MAX_OBSERVED_CONTEXT_MESSAGES),
             ).fetchall()
-            preserved_observed: List[Dict[str, Any]] = []
+
+            def _same_observed_message(
+                left: Dict[str, Any], right: Dict[str, Any]
+            ) -> bool:
+                if not right.get("observed"):
+                    return False
+                left_id = left.get("message_id") or left.get("platform_message_id")
+                right_id = right.get("message_id") or right.get("platform_message_id")
+                if left_id and right_id:
+                    return left_id == right_id
+                return (
+                    left.get("role") == right.get("role")
+                    and left.get("content") == right.get("content")
+                )
+
+            retained_observed: List[Dict[str, Any]] = []
             for row in observed_rows:
                 candidate: Dict[str, Any] = {
                     "role": row["role"],
@@ -4055,26 +4079,19 @@ class SessionDB:
                 if row["platform_message_id"]:
                     candidate["message_id"] = row["platform_message_id"]
 
-                already_retained = any(
-                    message.get("observed")
-                    and (
-                        (
-                            candidate.get("message_id")
-                            and (
-                                message.get("message_id")
-                                or message.get("platform_message_id")
-                            )
-                            == candidate["message_id"]
-                        )
-                        or (
-                            message.get("role") == candidate["role"]
-                            and message.get("content") == candidate["content"]
-                        )
-                    )
-                    for message in compacted_messages
+                compacted_copy = next(
+                    (
+                        message
+                        for message in compacted_messages
+                        if _same_observed_message(candidate, message)
+                    ),
+                    None,
                 )
-                if not already_retained:
-                    preserved_observed.append(candidate)
+                retained_observed.append(compacted_copy or candidate)
+
+            compacted_without_observed = [
+                message for message in compacted_messages if not message.get("observed")
+            ]
 
             # Soft-archive the live turns: active=0 hides them from the live
             # context load, compacted=1 marks them as "summarized away" (vs
@@ -4088,7 +4105,9 @@ class SessionDB:
                 (session_id,),
             )
             inserted, tool_calls_total = self._insert_message_rows(
-                conn, session_id, [*preserved_observed, *compacted_messages]
+                conn,
+                session_id,
+                [*retained_observed, *compacted_without_observed],
             )
             # message_count / tool_call_count reflect the LIVE (active) set —
             # the archived rows are still on disk but not part of the live count.
@@ -4581,7 +4600,9 @@ class SessionDB:
 
         Only includes messages from sessions that ended via compression
         (``end_reason = 'compression'``), avoiding leakage from delegate-subagent
-        parent sessions that happen to share a ``parent_session_id`` link.
+        parent sessions that happen to share a ``parent_session_id`` link. The
+        newest :data:`MAX_OBSERVED_CONTEXT_MESSAGES` rows are selected globally
+        across those ancestors, then returned in stable chronological order.
         """
         lineage = self._session_lineage_root_to_tip(session_id)
         ancestor_ids = lineage[:-1]
@@ -4591,14 +4612,17 @@ class SessionDB:
         placeholders = ",".join("?" for _ in ancestor_ids)
         with self._lock:
             rows = self._conn.execute(
-                f"SELECT m.role, m.content, m.platform_message_id "
-                f"FROM messages m "
-                f"JOIN sessions s ON s.id = m.session_id "
-                f"WHERE m.session_id IN ({placeholders}) "
-                f"  AND m.observed = 1 AND m.active = 1 "
-                f"  AND s.end_reason = 'compression' "
-                f"ORDER BY m.id",
-                tuple(ancestor_ids),
+                f"SELECT role, content, platform_message_id FROM ("
+                f"  SELECT m.id AS message_row_id, m.role, m.content, "
+                f"         m.platform_message_id "
+                f"  FROM messages m "
+                f"  JOIN sessions s ON s.id = m.session_id "
+                f"  WHERE m.session_id IN ({placeholders}) "
+                f"    AND m.observed = 1 AND m.active = 1 "
+                f"    AND s.end_reason = 'compression' "
+                f"  ORDER BY m.id DESC LIMIT ?"
+                f") ORDER BY message_row_id",
+                (*ancestor_ids, MAX_OBSERVED_CONTEXT_MESSAGES),
             ).fetchall()
 
         result = []
