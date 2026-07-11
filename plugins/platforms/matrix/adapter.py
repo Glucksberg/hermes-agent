@@ -3366,11 +3366,10 @@ class MatrixAdapter(BasePlatformAdapter):
         thread_id: str | None,
         event_id: str,
     ):
-        """Return an actor-authenticated source that still shares the room transcript.
+        """Return the actor-authenticated source for an addressed room turn.
 
-        The active @mentioned turn must preserve the sender identity for gateway
-        authorization and audit logs, while observed context must be read from
-        the room/thread-level session shared by all participants.
+        Session-key isolation remains entirely controlled by the gateway's
+        group_sessions_per_user/thread_sessions_per_user configuration.
         """
         source = self.build_source(
             chat_id=identity.room_id,
@@ -3385,7 +3384,6 @@ class MatrixAdapter(BasePlatformAdapter):
             message_id=event_id,
         )
         source.profile = getattr(self, "_gateway_profile", None)
-        source.force_shared_session = True
         return source
 
     @staticmethod
@@ -3639,7 +3637,7 @@ class MatrixAdapter(BasePlatformAdapter):
         body, is_dm, chat_type, thread_id, display_name, source = ctx
         channel_prompt = (
             self._matrix_observed_context_prompt()
-            if source.force_shared_session
+            if self._matrix_observed_context_enabled_for_room(room_id, is_dm)
             else None
         )
 
@@ -3886,7 +3884,7 @@ class MatrixAdapter(BasePlatformAdapter):
         body, is_dm, chat_type, thread_id, display_name, source = ctx
         channel_prompt = (
             self._matrix_observed_context_prompt()
-            if source.force_shared_session
+            if self._matrix_observed_context_enabled_for_room(room_id, is_dm)
             else None
         )
 
