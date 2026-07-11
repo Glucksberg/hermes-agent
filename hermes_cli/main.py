@@ -8068,7 +8068,9 @@ def _is_windows() -> bool:
 
 def _venv_python_path(venv_dir: Path) -> Path:
     """Return the platform-specific Python executable path for a venv."""
-    scripts = venv_dir / ("Scripts" if _is_windows() else "bin")
+    from hermes_constants import venv_bin_dir
+
+    scripts = venv_bin_dir(venv_dir, windows=_is_windows())
     return scripts / ("python.exe" if _is_windows() else "python")
 
 
@@ -8128,7 +8130,15 @@ def _candidate_update_venvs(project_root: Path = PROJECT_ROOT) -> list[Path]:
 
 
 def _select_update_venv(project_root: Path = PROJECT_ROOT) -> tuple[Path, Path] | None:
-    """Find the venv Python that should drive ``hermes update``."""
+    """Find the venv Python that should drive ``hermes update``.
+
+    Keep the active candidate when Hermes is already running from one. This
+    avoids switching an update from a managed ``venv`` into a co-located
+    development ``.venv``. Otherwise, use the stable project-preferred order:
+    ``.venv``, then ``venv``. Profile-aware ``$HERMES_HOME/hermes-agent``
+    candidates are included only for git checkouts, as a fallback for
+    worktrees that share the main install's environment.
+    """
     candidates: list[tuple[Path, Path]] = []
     for venv_dir in _candidate_update_venvs(project_root):
         python = _venv_python_path(venv_dir)
@@ -8201,7 +8211,9 @@ def _maybe_reexec_update_in_managed_venv(args) -> bool:
         print("  Continuing with the current Python process.")
         return False
 
-    scripts_dir = venv_dir / ("Scripts" if _is_windows() else "bin")
+    from hermes_constants import venv_bin_dir
+
+    scripts_dir = venv_bin_dir(venv_dir, windows=_is_windows())
     env = {**os.environ, _UPDATE_VENV_REEXEC_ENV: "1", "VIRTUAL_ENV": str(venv_dir)}
     env.pop("PYTHONPATH", None)
     env["PATH"] = f"{scripts_dir}{os.pathsep}{env.get('PATH', '')}"
