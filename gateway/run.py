@@ -10512,7 +10512,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             group_sessions_per_user=_group_sessions_per_user,
             thread_sessions_per_user=_thread_sessions_per_user,
         )
-        if _is_shared_multi_user and source.user_name and not getattr(source, "force_shared_session", False):
+        if (
+            _is_shared_multi_user
+            and source.user_name
+            and not _uses_observed_group_context(event.channel_prompt)
+        ):
             message_text = f"[{source.user_name}] {message_text}"
 
         # Prepend channel context from history backfill (if any).  This
