@@ -4014,8 +4014,11 @@ class SessionDB:
 
         Soft-archives every currently-active message (``active = 0``) and
         inserts *compacted_messages* as fresh active rows — atomically, in one
-        write transaction. The conversation keeps ONE session id for life
-        (#38763) WITHOUT destroying history:
+        write transaction. Active observed messages are carried forward beside
+        the compacted context because they are out-of-band gateway context and
+        therefore may not be represented in the model-generated summary. The
+        conversation keeps ONE session id for life (#38763) WITHOUT destroying
+        history:
 
         - The live-context load (:meth:`get_messages_as_conversation`,
           :meth:`get_messages`) filters ``active = 1`` by default, so the model
@@ -4035,6 +4038,44 @@ class SessionDB:
         """
 
         def _do(conn):
+            observed_rows = conn.execute(
+                "SELECT role, content, timestamp, platform_message_id "
+                "FROM messages WHERE session_id = ? AND active = 1 "
+                "AND observed = 1 ORDER BY id",
+                (session_id,),
+            ).fetchall()
+            preserved_observed: List[Dict[str, Any]] = []
+            for row in observed_rows:
+                candidate: Dict[str, Any] = {
+                    "role": row["role"],
+                    "content": self._decode_content(row["content"]),
+                    "timestamp": row["timestamp"],
+                    "observed": True,
+                }
+                if row["platform_message_id"]:
+                    candidate["message_id"] = row["platform_message_id"]
+
+                already_retained = any(
+                    message.get("observed")
+                    and (
+                        (
+                            candidate.get("message_id")
+                            and (
+                                message.get("message_id")
+                                or message.get("platform_message_id")
+                            )
+                            == candidate["message_id"]
+                        )
+                        or (
+                            message.get("role") == candidate["role"]
+                            and message.get("content") == candidate["content"]
+                        )
+                    )
+                    for message in compacted_messages
+                )
+                if not already_retained:
+                    preserved_observed.append(candidate)
+
             # Soft-archive the live turns: active=0 hides them from the live
             # context load, compacted=1 marks them as "summarized away" (vs
             # rewind/undo's active=0+compacted=0, which means "user took it
@@ -4047,7 +4088,7 @@ class SessionDB:
                 (session_id,),
             )
             inserted, tool_calls_total = self._insert_message_rows(
-                conn, session_id, compacted_messages
+                conn, session_id, [*preserved_observed, *compacted_messages]
             )
             # message_count / tool_call_count reflect the LIVE (active) set —
             # the archived rows are still on disk but not part of the live count.

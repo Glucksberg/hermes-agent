@@ -741,6 +741,47 @@ class TestLoadTranscriptDBOnly:
 
         assert [msg["content"] for msg in result] == ["current child turn"]
 
+    def test_load_transcript_keeps_observed_context_across_in_place_compaction(
+        self, tmp_path, monkeypatch
+    ):
+        import hermes_state
+
+        monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
+        store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+        session_id = "in_place_session"
+        observed_audio = "[Alice|111]\n[audio 'voice.ogg' saved at: /tmp/audio.ogg]"
+        store._db.create_session(session_id=session_id, source="gateway", model="m")
+        store._db.append_message(
+            session_id=session_id,
+            role="user",
+            content=observed_audio,
+            observed=True,
+            platform_message_id="tg-1",
+        )
+        store._db.append_message(
+            session_id=session_id,
+            role="user",
+            content="ordinary turn",
+        )
+
+        store._db.archive_and_compact(
+            session_id,
+            [{"role": "assistant", "content": "first compacted summary"}],
+        )
+        store._db.archive_and_compact(
+            session_id,
+            [{"role": "assistant", "content": "second compacted summary"}],
+        )
+
+        result = store.load_transcript(session_id)
+
+        assert [message["content"] for message in result] == [
+            observed_audio,
+            "second compacted summary",
+        ]
+        assert result[0]["observed"] is True
+        assert result[0]["message_id"] == "tg-1"
+
 
 class TestSessionStoreSwitchSession:
     """Regression coverage for gateway /resume session switching semantics."""
