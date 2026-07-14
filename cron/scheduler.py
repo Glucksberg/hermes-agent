@@ -172,14 +172,16 @@ def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str] | None:
     """Resolve the toolset list for a cron job.
 
     Precedence:
-    1. Per-job ``enabled_toolsets`` (set via ``cronjob`` tool on create/update).
+    1. Guarded jobs require explicit repository-owned built-in toolsets and do
+       not inherit global MCP/custom toolsets.
+    2. Legacy per-job ``enabled_toolsets`` (set via ``cronjob`` on create/update).
        Keeps the agent's job-scoped toolset override intact — #6130. Enabled
        MCP servers are layered on per ``_merge_mcp_into_per_job_toolsets`` so a
        native-toolset allowlist does not silently strip MCP tools.
-    2. Per-platform ``hermes tools`` config for the ``cron`` platform.
+    3. Per-platform ``hermes tools`` config for the ``cron`` platform.
        Mirrors gateway behavior (``_get_platform_tools(cfg, platform_key)``)
        so users can gate cron toolsets globally without recreating every job.
-    3. ``None`` on any lookup failure — AIAgent loads the full default set
+    4. ``None`` on any lookup failure — AIAgent loads the full default set
        (legacy behavior before this change, preserved as the safety net).
 
     _DEFAULT_OFF_TOOLSETS ({moa, homeassistant, rl}) are removed by
@@ -187,7 +189,18 @@ def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str] | None:
     get cron WITHOUT ``moa`` by default (issue reported by Norbert —
     surprise $4.63 run).
     """
+    guardrails_active = any(field in job for field in _GUARDRAIL_FIELDS)
     per_job = job.get("enabled_toolsets")
+    if guardrails_active:
+        explicit = [str(name).strip() for name in (per_job or []) if str(name).strip()]
+        if not explicit:
+            raise RuntimeError(
+                "guarded cron jobs require an explicit enabled_toolsets allowlist"
+            )
+
+        _resolve_cron_exact_tool_names(job, explicit)
+        return explicit
+
     if per_job:
         return _merge_mcp_into_per_job_toolsets(list(per_job), cfg or {})
     try:
@@ -199,6 +212,153 @@ def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str] | None:
             exc,
         )
         return None
+
+
+_CRON_EXACT_FILE_TOOL_NAMES = frozenset({
+    "read_file",
+    "search_files",
+    "write_file",
+    "patch",
+})
+_CRON_EXACT_TERMINAL_TOOL_NAMES = frozenset({"terminal"})
+
+
+def _resolve_cron_exact_tool_names(
+    job: dict,
+    enabled_toolsets: list[str] | None = None,
+) -> frozenset[str]:
+    """Return the one immutable tool-name posture allowed for guarded cron.
+
+    Guarded jobs deliberately do not accept arbitrary built-in toolsets. Static
+    toolset names are re-expanded through the live registry during AIAgent
+    construction, so even a repository-defined name is not an execution
+    boundary by itself.
+    """
+    explicit = (
+        [str(name).strip() for name in enabled_toolsets if str(name).strip()]
+        if enabled_toolsets is not None
+        else [
+            str(name).strip()
+            for name in (job.get("enabled_toolsets") or [])
+            if str(name).strip()
+        ]
+    )
+    from cron.jobs import _guarded_cron_posture
+
+    try:
+        posture = _guarded_cron_posture({**job, "enabled_toolsets": explicit})
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
+
+    if posture == "file":
+        return _CRON_EXACT_FILE_TOOL_NAMES
+    if posture == "terminal":
+        return _CRON_EXACT_TERMINAL_TOOL_NAMES
+    raise RuntimeError("guarded cron job has no execution posture")
+
+
+def _apply_cron_exact_tool_boundary(
+    agent,
+    exact_tool_names: frozenset[str],
+) -> None:
+    """Clamp an already-built agent to a guarded cron's exact schema surface."""
+    exact_tool_names = frozenset(exact_tool_names)
+    tools = getattr(agent, "tools", None)
+    if not isinstance(tools, list):
+        tools = []
+    agent.tools = [
+        tool
+        for tool in tools
+        if isinstance(tool, dict)
+        and isinstance(tool.get("function"), dict)
+        and tool["function"].get("name") in exact_tool_names
+    ]
+    agent.valid_tool_names = {
+        tool["function"]["name"] for tool in agent.tools
+    }
+    agent._cron_exact_tool_names = exact_tool_names
+
+
+def _create_cron_file_environment(workdir: str, *, timeout: int = 60):
+    """Create a local file-only environment with an immutable execution root.
+
+    A cwd-only task override intentionally does not isolate ordinary sessions:
+    it resolves to the shared ``default`` terminal environment.  Guarded cron
+    file posture needs the opposite contract, so it registers this dedicated
+    environment under the raw run id before AIAgent exists.  The public
+    ``cwd`` attribute is read-only after construction and every shell-backed
+    file operation is serialized and forced back to the resolved root.  This
+    keeps relative V4A headers rooted even if unrelated interactive terminal
+    state changes concurrently.
+    """
+    from tools.environments.local import LocalEnvironment
+
+    root = str(Path(workdir).expanduser().resolve(strict=True))
+
+    class _ImmutableCronFileEnvironment(LocalEnvironment):
+        _hermes_guarded_cron = True
+        _hermes_external_diagnostics_disabled = True
+
+        def __init__(self):
+            self._cron_file_root = root
+            self._cron_file_execute_lock = threading.RLock()
+            super().__init__(cwd=root, timeout=timeout)
+
+        @property
+        def cwd(self) -> str:
+            return self._cron_file_root
+
+        @cwd.setter
+        def cwd(self, _value: str) -> None:
+            # LocalEnvironment normally persists ``cd`` through this public
+            # attribute.  File-only cron execution must never adopt it.
+            return
+
+        def execute(self, command: str, cwd: str = "", **kwargs):
+            with self._cron_file_execute_lock:
+                return super().execute(
+                    command,
+                    cwd=self._cron_file_root,
+                    **kwargs,
+                )
+
+    return _ImmutableCronFileEnvironment()
+
+
+def _validate_cron_sandbox_toolsets(
+    enabled_toolsets: list[str] | None,
+) -> list[str]:
+    """Return the foreground-only terminal selection for a sandboxed cron.
+
+    ``terminal`` normally expands to both the foreground-capable terminal tool
+    and the process registry.  Guarded cron deliberately maps that one direct
+    selection to the legacy single-tool alias so AIAgent never receives the
+    process schema.  Every other toolset (including a composite that happens to
+    contain terminal) is rejected before agent construction.
+    """
+    if not enabled_toolsets:
+        raise RuntimeError(
+            "cron terminal_sandbox requires an explicit sandbox-safe toolset "
+            "allowlist (for example: terminal)"
+        )
+
+    normalized = [str(name).strip() for name in enabled_toolsets if str(name).strip()]
+    if normalized == ["terminal"]:
+        # model_tools' legacy alias resolves to the terminal tool only, unlike
+        # the normal terminal bundle which also exposes process.
+        return ["terminal_tools"]
+
+    from toolsets import resolve_toolset
+
+    expanded: set[str] = set()
+    for toolset_name in normalized:
+        expanded.update(resolve_toolset(toolset_name, include_registry=False) or [])
+    raise RuntimeError(
+        "cron terminal_sandbox rejected configured toolsets that can bypass "
+        "the sandbox (unsafe tools: "
+        + ", ".join(sorted(expanded or set(normalized)))
+        + ")"
+    )
 
 # Valid delivery platforms — used to validate user-supplied platform names
 # in cron delivery targets, preventing env var enumeration via crafted names.
@@ -238,7 +398,15 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
     "QQBOT_HOME_CHANNEL": "QQ_HOME_CHANNEL",
 }
 
-from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run, claim_dispatch, heartbeat_run_claim
+from cron.jobs import (
+    _GUARDRAIL_FIELDS,
+    advance_next_run,
+    claim_dispatch,
+    get_due_jobs,
+    heartbeat_run_claim,
+    mark_job_run,
+    save_job_output,
+)
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -2548,6 +2716,105 @@ def _guard_job_credential_exfil(job: dict) -> None:
         raise RuntimeError(f"Cron job '{job_id}' blocked for safety: {err}")
 
 
+def _await_cron_agent(
+    *,
+    agent,
+    future: concurrent.futures.Future,
+    job: dict,
+    inactivity_limit: Optional[float],
+    max_duration_seconds: Optional[float],
+    poll_interval: float = 5.0,
+    heartbeat_callback=None,
+):
+    """Await an agent with independent inactivity and wall-clock limits."""
+    started = time.monotonic()
+    poll_interval = max(0.001, float(poll_interval))
+    duration_limit = (
+        float(max_duration_seconds)
+        if max_duration_seconds is not None and float(max_duration_seconds) > 0
+        else None
+    )
+    job_name = str(job.get("name") or job.get("id") or "cron job")
+
+    def _interrupt_and_acknowledge(
+        message: str, *, interrupt_reason: Optional[str] = None
+    ) -> None:
+        if hasattr(agent, "interrupt"):
+            try:
+                agent.interrupt(interrupt_reason or message)
+            except Exception:
+                logger.warning(
+                    "Cron deadline interrupt raised; waiting for worker termination",
+                    exc_info=True,
+                )
+        # Python cannot forcibly stop a non-cooperative worker thread.  Keep the
+        # run owned and its sandbox registered until the future acknowledges
+        # termination; only then may run_job's finally release or clean state.
+        while not future.done():
+            concurrent.futures.wait({future}, timeout=poll_interval)
+            if heartbeat_callback is not None:
+                try:
+                    heartbeat_callback()
+                except Exception:
+                    logger.debug(
+                        "Cron claim heartbeat failed while awaiting timed-out worker",
+                        exc_info=True,
+                    )
+        try:
+            future.exception()
+        except BaseException:
+            # The deadline result is authoritative, but observing the terminal
+            # future state acknowledges that no worker remains alive.
+            pass
+        raise TimeoutError(message)
+
+    while True:
+        elapsed = time.monotonic() - started
+        if duration_limit is not None and elapsed >= duration_limit:
+            message = (
+                f"Cron job '{job_name}' exceeded maximum duration "
+                f"of {duration_limit:g}s"
+            )
+            _interrupt_and_acknowledge(message)
+
+        wait_for = poll_interval
+        if duration_limit is not None:
+            wait_for = min(wait_for, max(0.001, duration_limit - elapsed))
+        done, _ = concurrent.futures.wait({future}, timeout=wait_for)
+        if done:
+            return future.result()
+
+        if heartbeat_callback is not None:
+            heartbeat_callback()
+
+        elapsed = time.monotonic() - started
+        if duration_limit is not None and elapsed >= duration_limit:
+            message = (
+                f"Cron job '{job_name}' exceeded maximum duration "
+                f"of {duration_limit:g}s"
+            )
+            _interrupt_and_acknowledge(message)
+
+        if inactivity_limit is not None:
+            activity = {}
+            if hasattr(agent, "get_activity_summary"):
+                try:
+                    activity = agent.get_activity_summary() or {}
+                except Exception:
+                    activity = {}
+            idle_seconds = float(activity.get("seconds_since_activity", 0.0) or 0.0)
+            if idle_seconds >= inactivity_limit:
+                last_desc = activity.get("last_activity_desc", "unknown")
+                message = (
+                    f"Cron job '{job_name}' idle for {int(idle_seconds)}s "
+                    f"(limit {int(inactivity_limit)}s) — last activity: {last_desc}"
+                )
+                _interrupt_and_acknowledge(
+                    message,
+                    interrupt_reason="Cron job timed out (inactivity)",
+                )
+
+
 def run_job(
     job: dict, *, defer_agent_teardown: Optional[list] = None
 ) -> tuple[bool, str, str, Optional[str]]:
@@ -2757,6 +3024,19 @@ def run_job(
     if script_path:
         prerun_script = _run_job_script_with_claim_heartbeat(job, script_path)
         _ran_ok, _script_output = prerun_script
+        if not _ran_ok and job.get("script_fail_closed") is True:
+            logger.error(
+                "Job '%s' (ID: %s): pre-run script failed and script_fail_closed is enabled",
+                job_name, job_id,
+            )
+            failed_doc = (
+                f"# Cron Job: {job_name} (FAILED)\n\n"
+                f"**Job ID:** {job_id}\n"
+                f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"**Status:** pre-run script failed closed\n\n"
+                f"```\n{_script_output}\n```\n"
+            )
+            return False, failed_doc, "", _script_output
         if _ran_ok and not _parse_wake_gate(_script_output):
             logger.info(
                 "Job '%s' (ID: %s): wakeAgent=false, skipping agent run",
@@ -2805,6 +3085,9 @@ def run_job(
     logger.info("Prompt: %s", prompt[:100])
 
     agent = None
+    _cron_sandbox_env = None
+    _cron_file_env = None
+    _cron_file_marker_registered = False
 
     # Mark this as a cron session so the approval system can apply cron_mode.
     # This env var is process-wide and persists for the lifetime of the
@@ -2897,6 +3180,60 @@ def run_job(
             os.environ["TERMINAL_CWD"] = _job_workdir
             logger.info("Job '%s': using workdir %s", job_id, _job_workdir)
 
+        if job.get("restrict_file_tools_to_workdir") is True:
+            if not _job_workdir:
+                raise RuntimeError(
+                    "cron restrict_file_tools_to_workdir requires an existing workdir"
+                )
+            from tools.terminal_tool import (
+                _active_environments,
+                _env_lock,
+                _last_activity,
+                register_task_env_overrides,
+            )
+
+            _cron_file_env = _create_cron_file_environment(_job_workdir)
+            with _env_lock:
+                if _cron_session_id in _active_environments:
+                    raise RuntimeError(
+                        f"cron file environment task id collision: {_cron_session_id}"
+                    )
+                _active_environments[_cron_session_id] = _cron_file_env
+                _last_activity[_cron_session_id] = time.time()
+
+            register_task_env_overrides(
+                _cron_session_id,
+                {
+                    "cwd": _job_workdir,
+                    "cron_restricted_file_tools": True,
+                },
+            )
+            _cron_file_marker_registered = True
+
+        if job.get("terminal_sandbox") is True:
+            if not _job_workdir:
+                raise RuntimeError(
+                    "cron terminal_sandbox requires an existing workdir"
+                )
+            from tools.environments.cron_unshare import CronUnshareEnvironment
+            from tools.terminal_tool import (
+                _active_environments,
+                _env_lock,
+                _last_activity,
+            )
+
+            _cron_sandbox_env = CronUnshareEnvironment(
+                workdir=_job_workdir,
+                timeout=60,
+            )
+            with _env_lock:
+                if _cron_session_id in _active_environments:
+                    raise RuntimeError(
+                        f"cron sandbox task id collision: {_cron_session_id}"
+                    )
+                _active_environments[_cron_session_id] = _cron_sandbox_env
+                _last_activity[_cron_session_id] = time.time()
+
         # Re-read .env and config.yaml fresh every run so provider/key
         # changes take effect without a gateway restart. Route through
         # load_hermes_dotenv (not a bare load_dotenv) and reset the secret-
@@ -2935,6 +3272,7 @@ def run_job(
 
         # Load config.yaml for model, reasoning, prefill, toolsets, provider routing
         _cfg = {}
+        _model_cfg = {}
         try:
             import yaml
             _cfg_path = str(_get_hermes_home() / "config.yaml")
@@ -2988,18 +3326,21 @@ def run_job(
         except Exception:
             pass
 
-        # Reasoning config from config.yaml (raw value — a YAML boolean False
-        # means thinking disabled, see parse_reasoning_effort)
+        agent_cfg = _cfg.get("agent", {}) if isinstance(_cfg.get("agent", {}), dict) else {}
+
+        # Explicit per-job reasoning overrides config.yaml. Keep the raw value
+        # so YAML/job boolean False retains its documented disabled meaning.
         from hermes_constants import parse_reasoning_effort
         reasoning_config = parse_reasoning_effort(
-            _cfg.get("agent", {}).get("reasoning_effort", "")
+            job["reasoning_effort"]
+            if "reasoning_effort" in job
+            else agent_cfg.get("reasoning_effort", "")
         )
 
         # Prefill messages from env or config.yaml. The top-level
         # prefill_messages_file key is canonical; agent.prefill_messages_file is
         # retained as a legacy fallback for older CLI/godmode configs.
         prefill_messages = None
-        agent_cfg = _cfg.get("agent", {}) if isinstance(_cfg.get("agent", {}), dict) else {}
         prefill_file = (
             os.getenv("HERMES_PREFILL_MESSAGES_FILE", "")
             or _cfg.get("prefill_messages_file", "")
@@ -3019,8 +3360,14 @@ def run_job(
                     logger.warning("Job '%s': failed to parse prefill messages file '%s': %s", job_id, pfpath, e)
                     prefill_messages = None
 
-        # Max iterations
-        max_iterations = _cfg.get("agent", {}).get("max_turns") or _cfg.get("max_turns") or 90
+        # Max iterations: an explicit per-job guardrail overrides global config.
+        _agent_max_turns = agent_cfg.get("max_turns") if isinstance(agent_cfg, dict) else None
+        _legacy_max_turns = _cfg.get("max_turns") if isinstance(_cfg, dict) else None
+        max_iterations = (
+            job["max_iterations"]
+            if "max_iterations" in job
+            else (_agent_max_turns or _legacy_max_turns or 90)
+        )
 
         # Provider routing
         pr = _cfg.get("provider_routing") or {}
@@ -3073,6 +3420,30 @@ def run_job(
         except Exception as exc:
             message = format_runtime_provider_error(exc)
             raise RuntimeError(message) from exc
+
+        # Per-job output caps take precedence over the existing global sources.
+        # When absent, retain the normal env -> model config -> provider-cap
+        # resolution used by other agent entry points.
+        global_max_tokens = None
+        env_max_tokens = os.getenv("HERMES_MAX_TOKENS")
+        if env_max_tokens:
+            try:
+                parsed_max_tokens = int(env_max_tokens)
+                if parsed_max_tokens > 0:
+                    global_max_tokens = parsed_max_tokens
+            except (TypeError, ValueError):
+                pass
+        elif isinstance(_model_cfg, dict):
+            configured_max_tokens = _model_cfg.get("max_tokens")
+            if type(configured_max_tokens) is int and configured_max_tokens > 0:
+                global_max_tokens = configured_max_tokens
+        if global_max_tokens is None:
+            provider_max_tokens = runtime.get("max_output_tokens")
+            if type(provider_max_tokens) is int and provider_max_tokens > 0:
+                global_max_tokens = provider_max_tokens
+        max_tokens = (
+            job["max_tokens"] if "max_tokens" in job else global_max_tokens
+        )
 
         # Provider/model-drift fail-closed guard (#44585).
         #
@@ -3146,6 +3517,20 @@ def run_job(
             except Exception as e:
                 logger.debug("Job '%s': failed to load credential pool for %s: %s", job_id, runtime_provider, e)
 
+        _cron_guardrails_active = any(
+            field in job for field in _GUARDRAIL_FIELDS
+        )
+        _cron_enabled_toolsets = _resolve_cron_enabled_toolsets(job, _cfg)
+        _cron_exact_tool_names = (
+            _resolve_cron_exact_tool_names(job, _cron_enabled_toolsets)
+            if _cron_guardrails_active
+            else None
+        )
+        if _cron_sandbox_env is not None:
+            _cron_enabled_toolsets = _validate_cron_sandbox_toolsets(
+                _cron_enabled_toolsets
+            )
+
         # Initialize MCP servers so configured mcp_servers are available to
         # the agent's tool registry before AIAgent is constructed. Without
         # this, cron jobs never saw any MCP tools — only the gateway / CLI
@@ -3153,19 +3538,20 @@ def run_job(
         # ticks short-circuit on already-connected servers inside
         # register_mcp_servers(). Non-fatal on failure: a broken MCP server
         # shouldn't kill an otherwise-working cron job. See #4219.
-        try:
-            from tools.mcp_tool import discover_mcp_tools
-            _mcp_tools = discover_mcp_tools()
-            if _mcp_tools:
-                logger.info(
-                    "Job '%s': %d MCP tool(s) available",
-                    job_id, len(_mcp_tools),
+        if not _cron_guardrails_active:
+            try:
+                from tools.mcp_tool import discover_mcp_tools
+                _mcp_tools = discover_mcp_tools()
+                if _mcp_tools:
+                    logger.info(
+                        "Job '%s': %d MCP tool(s) available",
+                        job_id, len(_mcp_tools),
+                    )
+            except Exception as _mcp_exc:
+                logger.warning(
+                    "Job '%s': MCP initialization failed (non-fatal): %s",
+                    job_id, _mcp_exc,
                 )
-        except Exception as _mcp_exc:
-            logger.warning(
-                "Job '%s': MCP initialization failed (non-fatal): %s",
-                job_id, _mcp_exc,
-            )
 
         agent = AIAgent(
             model=model,
@@ -3176,6 +3562,16 @@ def run_job(
             acp_command=runtime.get("command"),
             acp_args=runtime.get("args"),
             max_iterations=max_iterations,
+            max_tokens=max_tokens,
+            cron_hard_max_tokens=job.get("max_tokens"),
+            max_tool_output_bytes=job.get("max_tool_output_bytes"),
+            max_total_tool_output_bytes=job.get("max_total_tool_output_bytes"),
+            max_tool_calls=job.get("max_tool_calls"),
+            max_files_read=job.get("max_files_read"),
+            restrict_file_tools_to_workdir=job.get(
+                "restrict_file_tools_to_workdir", False
+            ),
+            file_tool_workdir=_job_workdir,
             reasoning_config=reasoning_config,
             prefill_messages=prefill_messages,
             fallback_model=fallback_model,
@@ -3185,21 +3581,33 @@ def run_job(
             providers_order=pr.get("order"),
             provider_sort=pr.get("sort"),
             openrouter_min_coding_score=(_cfg.get("openrouter") or {}).get("min_coding_score"),
-            enabled_toolsets=_resolve_cron_enabled_toolsets(job, _cfg),
+            enabled_toolsets=_cron_enabled_toolsets,
             disabled_toolsets=_resolve_cron_disabled_toolsets(_cfg),
             quiet_mode=True,
             # Cron jobs should always inherit the user's SOUL.md identity from
             # HERMES_HOME. When a workdir is configured, also inject project
             # context files (AGENTS.md / CLAUDE.md / .cursorrules) from there.
-            # Without a workdir, keep cwd context discovery disabled.
-            skip_context_files=not bool(_job_workdir),
+            # Without a workdir, keep cwd context discovery disabled unless the
+            # job explicitly overrides that legacy default.
+            skip_context_files=(
+                job["skip_context_files"]
+                if "skip_context_files" in job
+                else not bool(_job_workdir)
+            ),
             load_soul_identity=True,
             skip_memory=True,  # Cron system prompts would corrupt user representations
             platform="cron",
             session_id=_cron_session_id,
             session_db=_session_db,
         )
-        
+        agent._cron_guardrails_active = _cron_guardrails_active
+        if _cron_exact_tool_names is not None:
+            _apply_cron_exact_tool_boundary(agent, _cron_exact_tool_names)
+        if _cron_sandbox_env is not None:
+            # Keep terminal/file operations on the raw task key so they cannot
+            # fall back to a fresh unsandboxed environment.
+            agent._cron_sandbox_task_id = _cron_session_id
+
         # Run the agent with an *inactivity*-based timeout: the job can run
         # for hours if it's actively calling tools / receiving stream tokens,
         # but a hung API call or stuck tool with no activity for the configured
@@ -3257,80 +3665,38 @@ def run_job(
         _cron_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         # Preserve scheduler-scoped ContextVar state (for example skill-declared
         # env passthrough registrations) when the cron run hops into the worker
-        # thread used for inactivity timeout monitoring.
+        # thread used for timeout monitoring.  task_id keeps terminal and other
+        # task-scoped environments isolated to this specific cron run.
         _cron_context = contextvars.copy_context()
-        _cron_future = _cron_pool.submit(_cron_context.run, agent.run_conversation, prompt)
-        _inactivity_timeout = False
+        _run_kwargs = (
+            {"task_id": _cron_session_id}
+            if _cron_sandbox_env is not None or _cron_file_marker_registered
+            else {}
+        )
+        _cron_future = _cron_pool.submit(
+            _cron_context.run,
+            agent.run_conversation,
+            prompt,
+            **_run_kwargs,
+        )
         try:
-            if _cron_inactivity_limit is None:
-                # Unlimited — no inactivity watchdog, but a one-shot still
-                # needs its run_claim heartbeat, so poll instead of blocking.
-                if _is_oneshot:
-                    result = None
-                    while True:
-                        done, _ = concurrent.futures.wait(
-                            {_cron_future}, timeout=_POLL_INTERVAL,
-                        )
-                        if done:
-                            result = _cron_future.result()
-                            break
-                        _heartbeat_run_claim_if_due()
-                else:
-                    result = _cron_future.result()
-            else:
-                result = None
-                while True:
-                    done, _ = concurrent.futures.wait(
-                        {_cron_future}, timeout=_POLL_INTERVAL,
-                    )
-                    if done:
-                        result = _cron_future.result()
-                        break
-                    _heartbeat_run_claim_if_due()
-                    # Agent still running — check inactivity.
-                    _idle_secs = 0.0
-                    if hasattr(agent, "get_activity_summary"):
-                        try:
-                            _act = agent.get_activity_summary()
-                            _idle_secs = _act.get("seconds_since_activity", 0.0)
-                        except Exception:
-                            pass
-                    if _idle_secs >= _cron_inactivity_limit:
-                        _inactivity_timeout = True
-                        break
-        except Exception:
-            _cron_pool.shutdown(wait=False, cancel_futures=True)
-            raise
-        finally:
-            _cron_pool.shutdown(wait=False, cancel_futures=True)
-
-        if _inactivity_timeout:
-            # Build diagnostic summary from the agent's activity tracker.
-            _activity = {}
-            if hasattr(agent, "get_activity_summary"):
-                try:
-                    _activity = agent.get_activity_summary()
-                except Exception:
-                    pass
-            _last_desc = _activity.get("last_activity_desc", "unknown")
-            _secs_ago = _activity.get("seconds_since_activity", 0)
-            _cur_tool = _activity.get("current_tool")
-            _iter_n = _activity.get("api_call_count", 0)
-            _iter_max = _activity.get("max_iterations", 0)
-
-            logger.error(
-                "Job '%s' idle for %.0fs (inactivity limit %.0fs) "
-                "| last_activity=%s | iteration=%s/%s | tool=%s",
-                job_name, _secs_ago, _cron_inactivity_limit,
-                _last_desc, _iter_n, _iter_max,
-                _cur_tool or "none",
+            result = _await_cron_agent(
+                agent=agent,
+                future=_cron_future,
+                job=job,
+                inactivity_limit=_cron_inactivity_limit,
+                max_duration_seconds=job.get("max_duration_seconds"),
+                poll_interval=_POLL_INTERVAL,
+                heartbeat_callback=_heartbeat_run_claim_if_due,
             )
-            if hasattr(agent, "interrupt"):
-                agent.interrupt("Cron job timed out (inactivity)")
-            raise TimeoutError(
-                f"Cron job '{job_name}' idle for "
-                f"{int(_secs_ago)}s (limit {int(_cron_inactivity_limit)}s) "
-                f"— last activity: {_last_desc}"
+        finally:
+            # Guarded environments cannot be unregistered while a worker may
+            # still issue file/terminal calls.  _await_cron_agent normally
+            # observes completion already; wait=True also closes the external
+            # interruption path before the outer cleanup runs.
+            _cron_pool.shutdown(
+                wait=bool(_cron_file_env is not None or _cron_sandbox_env is not None),
+                cancel_futures=True,
             )
 
         # Guard against non-dict returns from run_conversation under error conditions
@@ -3438,6 +3804,61 @@ def run_job(
         return False, output, "", error_msg
 
     finally:
+        if _cron_file_marker_registered:
+            try:
+                from tools.terminal_tool import clear_task_env_overrides
+
+                clear_task_env_overrides(_cron_session_id)
+            except Exception as e:
+                logger.debug(
+                    "Job '%s': failed to clear restricted file-task marker: %s",
+                    job_id,
+                    e,
+                )
+        if _cron_file_env is not None or _cron_sandbox_env is not None:
+            from tools.file_tools import clear_file_ops_cache
+            from tools.terminal_tool import (
+                _active_environments,
+                _env_lock,
+                _last_activity,
+            )
+
+            try:
+                with _env_lock:
+                    _registered_cron_env = _active_environments.get(
+                        _cron_session_id
+                    )
+                    if any(
+                        _registered_cron_env is candidate
+                        for candidate in (_cron_file_env, _cron_sandbox_env)
+                        if candidate is not None
+                    ):
+                        _active_environments.pop(_cron_session_id, None)
+                        _last_activity.pop(_cron_session_id, None)
+            except (Exception, KeyboardInterrupt) as e:
+                logger.debug(
+                    "Job '%s': failed to unregister guarded cron environment: %s",
+                    job_id,
+                    e,
+                )
+            try:
+                clear_file_ops_cache(_cron_session_id)
+            except (Exception, KeyboardInterrupt) as e:
+                logger.debug(
+                    "Job '%s': failed to clear guarded cron file cache: %s",
+                    job_id,
+                    e,
+                )
+            for _cron_env in (_cron_file_env, _cron_sandbox_env):
+                if _cron_env is not None:
+                    try:
+                        _cron_env.cleanup()
+                    except (Exception, KeyboardInterrupt) as e:
+                        logger.debug(
+                            "Job '%s': failed to clean guarded cron environment: %s",
+                            job_id,
+                            e,
+                        )
         # Restore TERMINAL_CWD to whatever it was before this job ran.  We
         # only ever mutate it when the job has a workdir; see the setup block
         # at the top of run_job for the serialization guarantee.

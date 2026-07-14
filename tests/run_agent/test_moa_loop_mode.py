@@ -140,6 +140,89 @@ moa:
     assert agg_call.get("max_tokens") is None
 
 
+@pytest.mark.parametrize(
+    ("caller_max_tokens", "reference_max_tokens", "expected_reference"),
+    [
+        (256, 1024, 256),
+        (1024, 256, 256),
+        (None, 600, 600),
+    ],
+)
+def test_moa_reference_and_aggregator_respect_caller_token_ceiling(
+    monkeypatch,
+    tmp_path,
+    caller_max_tokens,
+    reference_max_tokens,
+    expected_reference,
+):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        f"""
+moa:
+  default_preset: review
+  presets:
+    review:
+      reference_max_tokens: {reference_max_tokens}
+      reference_models:
+        - provider: openai-codex
+          model: gpt-5.5
+      aggregator:
+        provider: openrouter
+        model: anthropic/claude-opus-4.8
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    calls = []
+
+    def fake_call_llm(**kwargs):
+        calls.append(kwargs)
+        return _response("ok")
+
+    monkeypatch.setattr("agent.moa_loop.call_llm", fake_call_llm)
+
+    from agent.moa_loop import MoAChatCompletions
+
+    facade = MoAChatCompletions("review")
+    kwargs = {"messages": [{"role": "user", "content": "solve"}]}
+    if caller_max_tokens is not None:
+        kwargs["max_tokens"] = caller_max_tokens
+    facade.create(**kwargs)
+
+    ref_call = next(c for c in calls if c["task"] == "moa_reference")
+    agg_call = next(c for c in calls if c["task"] == "moa_aggregator")
+    assert ref_call["max_tokens"] == expected_reference
+    assert agg_call.get("max_tokens") == caller_max_tokens
+
+
+def test_one_shot_moa_clamps_reference_and_aggregator_to_caller_ceiling(
+    monkeypatch,
+):
+    from agent.moa_loop import aggregate_moa_context
+
+    calls = []
+
+    def fake_call_llm(**kwargs):
+        calls.append(kwargs)
+        return _response("ok")
+
+    monkeypatch.setattr("agent.moa_loop.call_llm", fake_call_llm)
+    aggregate_moa_context(
+        user_prompt="solve",
+        api_messages=[{"role": "user", "content": "solve"}],
+        reference_models=[{"provider": "openai-codex", "model": "gpt-5.5"}],
+        aggregator={"provider": "openrouter", "model": "anthropic/claude-opus-4.8"},
+        reference_max_tokens=1024,
+        max_tokens=256,
+    )
+
+    ref_call = next(c for c in calls if c["task"] == "moa_reference")
+    agg_call = next(c for c in calls if c["task"] == "moa_aggregator")
+    assert ref_call["max_tokens"] == 256
+    assert agg_call["max_tokens"] == 256
+
+
 def test_moa_slots_routed_through_resolve_runtime_provider(monkeypatch):
     """Reference + aggregator slots must be called via their provider's real
     runtime (resolve_runtime_provider), not a bare provider/model call.

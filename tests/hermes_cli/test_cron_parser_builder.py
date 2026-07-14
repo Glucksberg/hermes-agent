@@ -51,6 +51,8 @@ def test_cron_create_options():
         "--name", "daily", "--deliver", "origin", "--repeat", "3",
         "--skill", "a", "--skill", "b", "--no-agent",
         "--workdir", "/tmp/x",
+        "--enabled-toolset", "file, terminal",
+        "--enabled-toolsets", "file",
     ])
     assert ns.schedule == "0 9 * * *"
     assert ns.prompt == "daily task prompt"
@@ -60,6 +62,7 @@ def test_cron_create_options():
     assert ns.skills == ["a", "b"]
     assert ns.no_agent is True
     assert ns.workdir == "/tmp/x"
+    assert ns.enabled_toolsets == ["file, terminal", "file"]
 
 
 def test_cron_edit_no_agent_tristate():
@@ -68,6 +71,42 @@ def test_cron_edit_no_agent_tristate():
     assert parser.parse_args(["cron", "edit", "j", "--no-agent"]).no_agent is True
     assert parser.parse_args(["cron", "edit", "j", "--agent"]).no_agent is False
     assert parser.parse_args(["cron", "edit", "j"]).no_agent is None
+
+
+def test_cron_guardrail_options_preserve_explicit_values_and_omission():
+    parser = _build()
+    ns = parser.parse_args([
+        "cron", "create", "30m", "safe task",
+        "--max-tool-calls", "7",
+        "--max-files-read", "4",
+        "--max-tokens", "512",
+        "--reasoning-effort", "high",
+        "--terminal-sandbox",
+        "--restrict-file-tools-to-workdir",
+    ])
+    assert ns.max_tool_calls == 7
+    assert ns.max_files_read == 4
+    assert ns.max_tokens == 512
+    assert ns.reasoning_effort == "high"
+    assert ns.terminal_sandbox is True
+    assert ns.restrict_file_tools_to_workdir is True
+    assert ns.script_fail_closed is None
+
+    omitted = parser.parse_args(["cron", "edit", "job-id"])
+    assert omitted.max_tool_calls is None
+    assert omitted.max_files_read is None
+    assert omitted.max_tokens is None
+    assert omitted.reasoning_effort is None
+    assert omitted.terminal_sandbox is None
+    assert omitted.restrict_file_tools_to_workdir is None
+
+    disabled = parser.parse_args([
+        "cron", "edit", "job-id",
+        "--no-terminal-sandbox",
+        "--no-restrict-file-tools-to-workdir",
+    ])
+    assert disabled.terminal_sandbox is False
+    assert disabled.restrict_file_tools_to_workdir is False
 
 
 def test_cron_dispatch_func_is_injected_handler():

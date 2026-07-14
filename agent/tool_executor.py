@@ -17,8 +17,10 @@ import json
 import logging
 import os
 import random
+import re
 import threading
 import time
+from pathlib import Path
 from typing import Any, Optional
 
 from agent.display import (
@@ -50,6 +52,45 @@ from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context
 
 logger = logging.getLogger(__name__)
 
+_CRON_HOST_CODE_TOOLS = frozenset({"execute_code"})
+
+
+def _cron_guardrail_state_owner(agent):
+    """Return the root agent that owns shared per-cron counters."""
+    owner = getattr(agent, "_cron_guardrail_parent", None)
+    return owner if owner is not None else agent
+
+
+def _has_active_cron_execution_guardrail(agent) -> bool:
+    """Whether detached or host execution could bypass a cron boundary."""
+    owner = _cron_guardrail_state_owner(agent)
+    if getattr(agent, "_cron_guardrails_active", False) or getattr(
+        owner, "_cron_guardrails_active", False
+    ):
+        return True
+    if getattr(agent, "_cron_sandbox_task_id", None):
+        return True
+    if getattr(agent, "platform", None) != "cron" and getattr(
+        owner, "platform", None
+    ) != "cron":
+        return False
+    if getattr(agent, "restrict_file_tools_to_workdir", False) or getattr(
+        owner, "restrict_file_tools_to_workdir", False
+    ):
+        return True
+    for field in (
+        "max_tool_calls",
+        "max_files_read",
+        "max_tool_output_bytes",
+        "max_total_tool_output_bytes",
+        "_cron_hard_max_tokens",
+    ):
+        for source in (agent, owner):
+            value = getattr(source, field, None)
+            if type(value) is int and value > 0:
+                return True
+    return False
+
 
 def _budget_for_agent(agent) -> BudgetConfig:
     """Resolve a tool-result BudgetConfig scaled to the agent's context window.
@@ -65,6 +106,336 @@ def _budget_for_agent(agent) -> BudgetConfig:
         return budget_for_context_window(int(ctx)) if ctx else DEFAULT_BUDGET
     except Exception:
         return DEFAULT_BUDGET
+
+
+def _apply_cron_tool_output_limits(agent, output: Any) -> Any:
+    """Apply optional per-result and cumulative hard caps in UTF-8 bytes.
+
+    These limits are constructor-level agent controls used by guarded cron
+    sessions. Other agent entrypoints leave both values as ``None`` and retain
+    their existing behavior. Text is decoded with ``errors='ignore'`` after a
+    byte slice so a cap can never emit a partial UTF-8 code point.
+    """
+    if not isinstance(output, str):
+        return output
+
+    per_output = getattr(agent, "max_tool_output_bytes", None)
+    total = getattr(agent, "max_total_tool_output_bytes", None)
+    per_output = per_output if type(per_output) is int and per_output > 0 else None
+    total = total if type(total) is int and total > 0 else None
+    if per_output is None and total is None:
+        return output
+
+    owner = _cron_guardrail_state_owner(agent)
+    lock = getattr(owner, "_cron_guardrail_lock", None)
+    if lock is None:
+        lock = threading.Lock()
+        owner._cron_guardrail_lock = lock
+    with lock:
+        used = getattr(owner, "_tool_output_bytes_used", 0)
+        if type(used) is not int or used < 0:
+            used = 0
+        allowed = per_output
+        if total is not None:
+            remaining = max(0, total - used)
+            allowed = remaining if allowed is None else min(allowed, remaining)
+
+        encoded = output.encode("utf-8")
+        if allowed is not None and len(encoded) > allowed:
+            output = encoded[:allowed].decode("utf-8", errors="ignore")
+            encoded = output.encode("utf-8")
+
+        owner._tool_output_bytes_used = used + len(encoded)
+    return output
+
+
+def _cron_guardrail_error(field: str, detail: str) -> str:
+    return json.dumps(
+        {"error": f"Cron guardrail {field} blocked this tool call: {detail}"},
+        ensure_ascii=False,
+    )
+
+
+def _apply_cron_exact_tool_preflight(agent, function_name: str) -> str | None:
+    """Enforce the guarded cron's immutable name and handler boundary."""
+    owner = _cron_guardrail_state_owner(agent)
+    exact_names = getattr(agent, "_cron_exact_tool_names", None)
+    if not isinstance(exact_names, frozenset):
+        exact_names = getattr(owner, "_cron_exact_tool_names", None)
+    if not isinstance(exact_names, frozenset):
+        return None
+
+    if function_name not in exact_names:
+        return _cron_guardrail_error(
+            "exact_tool_names",
+            f"{function_name} is outside this guarded cron's exact tool set",
+        )
+
+    from tools import file_tools, terminal_tool
+    from tools.registry import registry
+
+    expected_handlers = {
+        "read_file": file_tools._handle_read_file,
+        "search_files": file_tools._handle_search_files,
+        "write_file": file_tools._handle_write_file,
+        "patch": file_tools._handle_patch,
+        "terminal": terminal_tool._handle_terminal,
+    }
+    expected_modules = {
+        "read_file": "tools.file_tools",
+        "search_files": "tools.file_tools",
+        "write_file": "tools.file_tools",
+        "patch": "tools.file_tools",
+        "terminal": "tools.terminal_tool",
+    }
+    entry = registry.get_entry(function_name)
+    expected_handler = expected_handlers.get(function_name)
+    expected_module = expected_modules.get(function_name)
+    if (
+        entry is None
+        or expected_handler is None
+        or entry.handler is not expected_handler
+        or getattr(entry.handler, "__module__", None) != expected_module
+    ):
+        return _cron_guardrail_error(
+            "exact_tool_handler",
+            f"{function_name} is not bound to its repository-owned expected implementation",
+        )
+    return None
+
+
+def _reserve_cron_tool_calls(agent, requested: int) -> int:
+    """Atomically reserve up to *requested* tool calls and return the grant."""
+    requested = max(0, int(requested))
+    limit = getattr(agent, "max_tool_calls", None)
+    if type(limit) is not int or limit <= 0:
+        return requested
+    owner = _cron_guardrail_state_owner(agent)
+    lock = getattr(owner, "_cron_guardrail_lock", None)
+    if lock is None:
+        lock = threading.Lock()
+        owner._cron_guardrail_lock = lock
+    with lock:
+        used = getattr(owner, "_tool_calls_used", 0)
+        if type(used) is not int or used < 0:
+            used = 0
+        granted = min(requested, max(0, limit - used))
+        owner._tool_calls_used = used + granted
+        return granted
+
+
+def _cron_file_workdir(agent) -> Path:
+    raw = (
+        getattr(agent, "file_tool_workdir", None)
+        or os.getenv("TERMINAL_CWD")
+        or os.getcwd()
+    )
+    return Path(raw).expanduser().resolve(strict=False)
+
+
+def _canonical_cron_file_path(agent, raw_path: str) -> Path:
+    path = Path(str(raw_path)).expanduser()
+    if not path.is_absolute():
+        path = _cron_file_workdir(agent) / path
+    return path.resolve(strict=False)
+
+
+def _cron_file_tool_paths(function_name: str, function_args: dict) -> list[str]:
+    if function_name in {"read_file", "write_file", "search_files"}:
+        default = "." if function_name == "search_files" else None
+        value = function_args.get("path", default)
+        return [value] if isinstance(value, str) and value else []
+    if function_name != "patch":
+        return []
+    if function_args.get("mode", "replace") != "patch":
+        value = function_args.get("path")
+        return [value] if isinstance(value, str) and value else []
+    patch_text = function_args.get("patch")
+    if not isinstance(patch_text, str):
+        return []
+    paths: list[str] = []
+    for match in re.finditer(
+        r"^\*\*\*\s*(?:Update|Add|Delete)\s+File:\s*(.+)$",
+        patch_text,
+        re.MULTILINE,
+    ):
+        paths.append(match.group(1).strip())
+    for match in re.finditer(
+        r"^\*\*\*\s*Move\s+File:\s*(.+?)\s*->\s*(.+)$",
+        patch_text,
+        re.MULTILINE,
+    ):
+        paths.extend((match.group(1).strip(), match.group(2).strip()))
+    return paths
+
+
+def _path_is_within(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def _reserve_unique_file_reads(agent, paths: list[Path]) -> bool:
+    limit = getattr(agent, "max_files_read", None)
+    if type(limit) is not int or limit <= 0:
+        return True
+    normalized = {str(path.resolve(strict=False)) for path in paths}
+    owner = _cron_guardrail_state_owner(agent)
+    lock = getattr(owner, "_cron_guardrail_lock", None)
+    if lock is None:
+        lock = threading.Lock()
+        owner._cron_guardrail_lock = lock
+    with lock:
+        seen = getattr(owner, "_files_read", None)
+        if not isinstance(seen, set):
+            seen = set()
+            owner._files_read = seen
+        new_paths = normalized - seen
+        if len(seen) + len(new_paths) > limit:
+            return False
+        seen.update(new_paths)
+        return True
+
+
+def _apply_cron_file_preflight(
+    agent,
+    function_name: str,
+    function_args: dict,
+    *,
+    count_reads: bool = True,
+) -> str | None:
+    """Enforce common cron execution and file-operation guardrails."""
+    exact_boundary_block = _apply_cron_exact_tool_preflight(agent, function_name)
+    if exact_boundary_block is not None:
+        return exact_boundary_block
+    if (
+        function_name == "delegate_task"
+        and _has_active_cron_execution_guardrail(agent)
+    ):
+        return _cron_guardrail_error(
+            "delegation",
+            "delegate_task is disabled while cron guardrails are active",
+        )
+    if (
+        function_name in _CRON_HOST_CODE_TOOLS
+        and _has_active_cron_execution_guardrail(agent)
+    ):
+        return _cron_guardrail_error(
+            "execution",
+            f"{function_name} cannot preserve the active cron hard caps and counters",
+        )
+    if getattr(agent, "_cron_sandbox_task_id", None):
+        if function_name == "process":
+            return _cron_guardrail_error(
+                "terminal_sandbox",
+                "process-registry operations are disabled for guarded cron",
+            )
+        if function_name == "terminal" and (
+            function_args.get("background") or function_args.get("pty")
+        ):
+            return _cron_guardrail_error(
+                "terminal_sandbox",
+                "background and PTY terminal modes are disabled for guarded cron",
+            )
+    if function_name not in {"read_file", "search_files", "write_file", "patch"}:
+        return None
+    restrict_files = getattr(agent, "restrict_file_tools_to_workdir", False)
+    if restrict_files and function_name == "patch":
+        mode = function_args.get("mode", "replace")
+        if mode != "replace":
+            return _cron_guardrail_error(
+                "restrict_file_tools_to_workdir",
+                "guarded cron rejects patch mode='patch'; use write_file to add "
+                "files or patch mode='replace' to edit one file",
+            )
+        target = function_args.get("path")
+        if not isinstance(target, str) or not target:
+            return _cron_guardrail_error(
+                "restrict_file_tools_to_workdir",
+                "guarded cron patch mode='replace' requires exactly one file path",
+            )
+    raw_paths = _cron_file_tool_paths(function_name, function_args)
+    canonical_paths = [_canonical_cron_file_path(agent, path) for path in raw_paths]
+    if restrict_files:
+        root = _cron_file_workdir(agent)
+        for raw_path, canonical in zip(raw_paths, canonical_paths):
+            if not _path_is_within(canonical, root):
+                return _cron_guardrail_error(
+                    "restrict_file_tools_to_workdir",
+                    f"path {raw_path!r} resolves outside cron workdir {str(root)!r}",
+                )
+        # Freeze every allowed path-bearing call to exactly what preflight
+        # checked. Guarded V4A is rejected above because its multi-operation
+        # body cannot be made TOCTOU-safe by rewriting one argument.
+        if canonical_paths:
+            function_args["path"] = str(canonical_paths[0])
+    if not count_reads:
+        return None
+    paths_to_count: list[Path] = []
+    if function_name == "read_file":
+        paths_to_count = canonical_paths
+    elif function_name == "search_files":
+        paths_to_count = [path for path in canonical_paths if path.is_file()]
+    if paths_to_count and not _reserve_unique_file_reads(agent, paths_to_count):
+        return _cron_guardrail_error(
+            "max_files_read",
+            f"unique-file limit {getattr(agent, 'max_files_read', 0)} reached",
+        )
+    return None
+
+
+def _search_result_file_paths(agent, output: Any) -> list[Path]:
+    if not isinstance(output, str):
+        return []
+    try:
+        payload, _end = json.JSONDecoder().raw_decode(output)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return []
+    if not isinstance(payload, dict) or payload.get("error"):
+        return []
+    raw_paths: set[str] = set()
+    for match in payload.get("matches") or []:
+        if isinstance(match, dict) and isinstance(match.get("path"), str):
+            raw_paths.add(match["path"])
+    for value in payload.get("files") or []:
+        if isinstance(value, str):
+            raw_paths.add(value)
+    counts = payload.get("counts") or {}
+    if isinstance(counts, dict):
+        raw_paths.update(path for path in counts if isinstance(path, str))
+    dense = payload.get("matches_text")
+    if isinstance(dense, str):
+        raw_paths.update(
+            line for line in dense.splitlines() if line and not line.startswith("  ")
+        )
+    return [_canonical_cron_file_path(agent, path) for path in raw_paths]
+
+
+def _apply_cron_file_result_guardrail(
+    agent,
+    function_name: str,
+    function_result: Any,
+) -> Any:
+    if function_name != "search_files":
+        return function_result
+    paths = _search_result_file_paths(agent, function_result)
+    if not paths:
+        return function_result
+    root = _cron_file_workdir(agent)
+    if getattr(agent, "restrict_file_tools_to_workdir", False):
+        if any(not _path_is_within(path, root) for path in paths):
+            return _cron_guardrail_error(
+                "restrict_file_tools_to_workdir",
+                "search results resolved outside the cron workdir",
+            )
+    if not _reserve_unique_file_reads(agent, paths):
+        return _cron_guardrail_error(
+            "max_files_read",
+            f"search would exceed unique-file limit {getattr(agent, 'max_files_read', 0)}",
+        )
+    return function_result
 
 # Maximum number of concurrent worker threads for parallel tool execution.
 # Mirrors the constant in ``run_agent`` for tests/imports that look here.
@@ -491,6 +862,11 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                         middleware_trace=list(middleware_trace),
                     )
 
+        if block_result is None:
+            block_result = _apply_cron_file_preflight(
+                agent, function_name, function_args, count_reads=False
+            )
+
         # ── Checkpoint preflight (only for tools that will execute) ──
         if block_result is None:
             # Checkpoint for file-mutating tools
@@ -516,6 +892,39 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     pass
 
         parsed_calls.append((tool_call, function_name, function_args, middleware_trace, block_result, blocked_by_guardrail))
+
+    # Reserve an entire runnable parallel batch with one lock acquisition.
+    # Calls beyond the remaining hard budget stay in transcript order but are
+    # converted into blocked tool results and are never submitted to workers.
+    runnable_indices = [
+        index
+        for index, call in enumerate(parsed_calls)
+        if call[4] is None
+    ]
+    granted = _reserve_cron_tool_calls(agent, len(runnable_indices))
+    if granted < len(runnable_indices):
+        limit = getattr(agent, "max_tool_calls", 0)
+        for index in runnable_indices[granted:]:
+            tc, name, args, trace, _block, guardrail_block = parsed_calls[index]
+            parsed_calls[index] = (
+                tc,
+                name,
+                args,
+                trace,
+                _cron_guardrail_error(
+                    "max_tool_calls", f"total tool-call limit {limit} reached"
+                ),
+                guardrail_block,
+            )
+    for index in runnable_indices[:granted]:
+        tc, name, args, trace, block, guardrail_block = parsed_calls[index]
+        if block is not None:
+            continue
+        file_block = _apply_cron_file_preflight(agent, name, args)
+        if file_block is not None:
+            parsed_calls[index] = (
+                tc, name, args, trace, file_block, guardrail_block
+            )
 
     # ── Logging / callbacks ──────────────────────────────────────────
     tool_names_str = ", ".join(name for _, name, _, _, _, _ in parsed_calls)
@@ -883,6 +1292,10 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 effect_disposition = "none"
 
             if not blocked:
+                function_result = _apply_cron_file_result_guardrail(
+                    agent, function_name, function_result
+                )
+                is_error, _ = _detect_tool_failure(function_name, function_result)
                 function_result = agent._append_guardrail_observation(
                     function_name,
                     function_args,
@@ -959,6 +1372,8 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 _append_subdir_hint_to_multimodal(function_result, subdir_hints)
             else:
                 function_result += subdir_hints
+
+        function_result = _apply_cron_tool_output_limits(agent, function_result)
 
         # Unwrap _multimodal dicts to an OpenAI-style content list so any
         # vision-capable provider receives [{type:text},{type:image_url}]
@@ -1122,6 +1537,30 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             guardrail_decision = agent._tool_guardrails.before_call(function_name, function_args)
             if not guardrail_decision.allows_execution:
                 _guardrail_block_decision = guardrail_decision
+
+        if _block_msg is None and _guardrail_block_decision is None:
+            _file_block = _apply_cron_file_preflight(
+                agent, function_name, function_args, count_reads=False
+            )
+            if _file_block is not None:
+                _block_msg = json.loads(_file_block)["error"]
+                _block_error_type = "cron_file_guardrail"
+
+        if _block_msg is None and _guardrail_block_decision is None:
+            if _reserve_cron_tool_calls(agent, 1) != 1:
+                _block_msg = (
+                    "Cron guardrail max_tool_calls blocked this tool call: "
+                    f"total tool-call limit {getattr(agent, 'max_tool_calls', 0)} reached"
+                )
+                _block_error_type = "cron_max_tool_calls"
+
+        if _block_msg is None and _guardrail_block_decision is None:
+            _file_block = _apply_cron_file_preflight(
+                agent, function_name, function_args
+            )
+            if _file_block is not None:
+                _block_msg = json.loads(_file_block)["error"]
+                _block_error_type = "cron_file_guardrail"
 
         _execution_blocked = _block_msg is not None or _guardrail_block_decision is not None
 
@@ -1557,6 +1996,18 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             result_preview = function_result
             _result_len = len(str(function_result))
 
+        if not _execution_blocked:
+            function_result = _apply_cron_file_result_guardrail(
+                agent, function_name, function_result
+            )
+            if isinstance(function_result, str):
+                result_preview = function_result if agent.verbose_logging else (
+                    function_result[:200]
+                    if len(function_result) > 200
+                    else function_result
+                )
+                _result_len = len(function_result)
+
         # Log tool errors to the persistent error log so [error] tags
         # in the UI always have a corresponding detailed entry on disk.
         _is_error_result, _ = _detect_tool_failure(function_name, function_result)
@@ -1649,6 +2100,8 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 _append_subdir_hint_to_multimodal(function_result, subdir_hints)
             else:
                 function_result += subdir_hints
+
+        function_result = _apply_cron_tool_output_limits(agent, function_result)
 
         # Unwrap _multimodal dicts to an OpenAI-style content list
         # (see parallel path for rationale). String results pass through.

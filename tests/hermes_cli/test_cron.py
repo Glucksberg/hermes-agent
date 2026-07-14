@@ -402,3 +402,95 @@ def test_cron_create_failure_returns_nonzero(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert rc == 1
     assert "Failed to create job: boom" in out
+
+
+def test_cron_create_forwards_only_explicit_guardrails(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        cron_cli,
+        "_cron_api",
+        lambda **kwargs: calls.append(kwargs) or {
+            "success": True,
+            "job_id": "job-1",
+            "name": "safe",
+            "schedule": "every hour",
+            "next_run_at": "later",
+        },
+    )
+    monkeypatch.setattr(cron_cli, "_warn_if_gateway_not_running", lambda: None)
+
+    args = SimpleNamespace(
+        schedule="every hour",
+        prompt="safe task",
+        max_tokens=512,
+        reasoning_effort=False,
+        max_tool_calls=3,
+        max_files_read=2,
+        restrict_file_tools_to_workdir=True,
+        enabled_toolsets=["file, terminal", "file"],
+    )
+    assert cron_cli.cron_create(args) == 0
+
+    assert calls[0]["max_tool_calls"] == 3
+    assert calls[0]["max_files_read"] == 2
+    assert calls[0]["max_tokens"] == 512
+    assert calls[0]["reasoning_effort"] is False
+    assert calls[0]["restrict_file_tools_to_workdir"] is True
+    assert calls[0]["enabled_toolsets"] == ["file", "terminal"]
+    assert "terminal_sandbox" not in calls[0]
+
+
+def test_cron_edit_forwards_inference_caps(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        "cron.jobs.resolve_job_ref",
+        lambda job_id: {"id": job_id, "name": "safe", "skills": []},
+    )
+    monkeypatch.setattr(
+        cron_cli,
+        "_cron_api",
+        lambda **kwargs: calls.append(kwargs) or {
+            "success": True,
+            "job": {
+                "job_id": "job-1",
+                "name": "safe",
+                "schedule": "every hour",
+            },
+        },
+    )
+
+    args = SimpleNamespace(
+        job_id="job-1",
+        max_tokens=256,
+        reasoning_effort="minimal",
+        enabled_toolsets=["terminal"],
+    )
+    assert cron_cli.cron_edit(args) == 0
+
+    assert calls[0]["action"] == "update"
+    assert calls[0]["max_tokens"] == 256
+    assert calls[0]["reasoning_effort"] == "minimal"
+    assert calls[0]["enabled_toolsets"] == ["terminal"]
+
+
+def test_cron_create_file_restriction_posture_end_to_end(
+    tmp_cron_dir, tmp_path, monkeypatch
+):
+    workdir = tmp_path / "guarded-repo"
+    workdir.mkdir()
+    monkeypatch.setattr(cron_cli, "_warn_if_gateway_not_running", lambda: None)
+
+    args = SimpleNamespace(
+        schedule="every 1h",
+        prompt="read local files",
+        enabled_toolsets=["file"],
+        workdir=str(workdir),
+        max_tokens=256,
+        restrict_file_tools_to_workdir=True,
+    )
+    assert cron_cli.cron_create(args) == 0
+
+    jobs = list_jobs(include_disabled=True)
+    assert len(jobs) == 1
+    assert jobs[0]["enabled_toolsets"] == ["file"]
+    assert jobs[0]["restrict_file_tools_to_workdir"] is True

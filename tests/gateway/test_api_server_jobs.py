@@ -76,6 +76,14 @@ def auth_adapter():
     return _make_adapter(api_key="sk-secret")
 
 
+@pytest.fixture
+def tmp_cron_dir(tmp_path, monkeypatch):
+    monkeypatch.setattr("cron.jobs.CRON_DIR", tmp_path / "cron")
+    monkeypatch.setattr("cron.jobs.JOBS_FILE", tmp_path / "cron" / "jobs.json")
+    monkeypatch.setattr("cron.jobs.OUTPUT_DIR", tmp_path / "cron" / "output")
+    return tmp_path
+
+
 # ---------------------------------------------------------------------------
 # 1. test_list_jobs
 # ---------------------------------------------------------------------------
@@ -168,6 +176,88 @@ class TestCreateJob:
                 assert call_kwargs["origin"]["chat_id"] == "api"
                 assert call_kwargs["origin"]["forwarded_for"] == "203.0.113.11"
                 assert call_kwargs["origin"]["user_agent"] == "cron-client"
+
+    @pytest.mark.asyncio
+    async def test_create_job_forwards_all_guardrails(self, adapter):
+        app = _create_app(adapter)
+        guardrails = {
+            "script_fail_closed": True,
+            "max_iterations": 8,
+            "max_tokens": 512,
+            "reasoning_effort": False,
+            "max_duration_seconds": 60,
+            "max_tool_output_bytes": 1024,
+            "max_total_tool_output_bytes": 4096,
+            "max_tool_calls": 7,
+            "max_files_read": 5,
+            "skip_context_files": True,
+            "terminal_sandbox": True,
+            "restrict_file_tools_to_workdir": True,
+        }
+        mock_create = MagicMock(return_value=SAMPLE_JOB)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+                f"{_MOD}._cron_create", mock_create
+            ):
+                resp = await cli.post("/api/jobs", json={
+                    "name": "guarded-job",
+                    "schedule": "*/5 * * * *",
+                    "prompt": "do something",
+                    "workdir": "/tmp/job",
+                    "enabled_toolsets": ["terminal"],
+                    **guardrails,
+                })
+        assert resp.status == 200
+        call_kwargs = mock_create.call_args.kwargs
+        for name, value in guardrails.items():
+            assert call_kwargs[name] == value
+        assert call_kwargs["enabled_toolsets"] == ["terminal"]
+
+    @pytest.mark.asyncio
+    async def test_create_terminal_sandbox_posture_end_to_end(
+        self, adapter, tmp_cron_dir, monkeypatch
+    ):
+        app = _create_app(adapter)
+        workdir = tmp_cron_dir / "sandbox-workdir"
+        workdir.mkdir()
+        monkeypatch.setattr(f"{_MOD}._notify_cron_provider_jobs_changed", lambda: None)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True):
+                resp = await cli.post("/api/jobs", json={
+                    "name": "guarded-terminal",
+                    "schedule": "every 1h",
+                    "prompt": "run a local command",
+                    "workdir": str(workdir),
+                    "enabled_toolsets": ["terminal"],
+                    "terminal_sandbox": True,
+                    "max_tokens": 256,
+                })
+                data = await resp.json()
+        assert resp.status == 200, data
+        assert data["job"]["enabled_toolsets"] == ["terminal"]
+        assert data["job"]["terminal_sandbox"] is True
+
+    @pytest.mark.asyncio
+    async def test_create_rejects_inexact_guarded_posture_as_bad_request(
+        self, adapter, tmp_cron_dir
+    ):
+        app = _create_app(adapter)
+        workdir = tmp_cron_dir / "bad-workdir"
+        workdir.mkdir()
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True):
+                resp = await cli.post("/api/jobs", json={
+                    "name": "bad-guardrail",
+                    "schedule": "every 1h",
+                    "prompt": "unsafe posture",
+                    "workdir": str(workdir),
+                    "enabled_toolsets": ["terminal", "file"],
+                    "terminal_sandbox": True,
+                    "max_tokens": 256,
+                })
+                data = await resp.json()
+        assert resp.status == 400
+        assert "exactly one execution posture" in data["error"]
 
     @pytest.mark.asyncio
     async def test_create_job_missing_name(self, adapter):
@@ -369,6 +459,29 @@ class TestUpdateJob:
                 assert "name" in sanitized
                 assert "evil_field" not in sanitized
                 assert "__proto__" not in sanitized
+
+    @pytest.mark.asyncio
+    async def test_update_job_forwards_guardrails(self, adapter):
+        app = _create_app(adapter)
+        mock_update = MagicMock(return_value=SAMPLE_JOB)
+        guardrails = {
+            "max_tokens": 256,
+            "reasoning_effort": "minimal",
+            "max_tool_calls": 9,
+            "max_files_read": 6,
+            "terminal_sandbox": False,
+            "restrict_file_tools_to_workdir": True,
+            "enabled_toolsets": ["file"],
+        }
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+                f"{_MOD}._cron_update", mock_update
+            ):
+                resp = await cli.patch(
+                    f"/api/jobs/{VALID_JOB_ID}", json=guardrails
+                )
+        assert resp.status == 200
+        assert mock_update.call_args.args == (VALID_JOB_ID, guardrails)
 
     @pytest.mark.asyncio
     async def test_update_job_no_valid_fields(self, adapter):
