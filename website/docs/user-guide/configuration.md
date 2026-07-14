@@ -1693,6 +1693,9 @@ display:
   show_reasoning: true    # Show model reasoning/thinking above each response (default: true; toggle with /reasoning show|hide)
   streaming: false        # Stream tokens to terminal as they arrive (real-time output)
   show_cost: false        # Show estimated $ cost in the CLI status bar
+  local_model_status:     # Classic CLI: llama.cpp residency bar for local routes
+    enabled: true
+    idle_timeout_seconds: null  # Match llama.cpp --sleep-idle-seconds for estimated countdown
   timestamps: false       # When true, prefixes user and assistant labels with timestamps in the CLI / TUI transcript
   timestamp_format: "%H:%M"  # strftime format for those timestamps (e.g. "%b-%d %H:%M" for month-day)
   tool_preview_length: 0  # Max chars for tool call previews (0 = no limit, show full paths/commands)
@@ -1732,6 +1735,18 @@ The tally is observed from the tool-progress feed the CLI already receives, so i
 The count is per-turn (session totals are baselined at turn start) and updates as each API call in the turn reports usage. Nothing renders before the first usage report lands, so you never see a misleading `↓ 0 tok`.
 
 Both keys are display-only and CLI-only: they are suppressed in quiet mode, when `display.tool_progress` is `off`, in single-query/`-Q` batch runs, and in gateway/messaging surfaces (those use `display.runtime_footer` instead). Set either key to `false` to turn it off.
+
+### Local llama.cpp residency status
+
+For an active local HTTP(S) route, the classic CLI probes llama.cpp's read-only `/props` endpoint on a background thread and can show model residency in the status bar:
+
+- `[██████████] on` — llama.cpp reports the model loaded.
+- `[██████████] ~4m43s` — loaded, with an estimated idle countdown.
+- `[▒▒▒▒▒▒▒▒▒▒] load` — the runtime is temporarily unavailable while loading.
+- `[░░░░░░░░░░] off` — llama.cpp explicitly reports `is_sleeping: true`.
+- `[░░░░░░░░░░] ?` — the local runtime cannot be confirmed.
+
+Set `idle_timeout_seconds` to the same value passed to llama.cpp as `--sleep-idle-seconds`. The `~` prefix is intentional: the countdown is an estimate based on the last completed Hermes turn. The runtime's `is_sleeping` value remains authoritative, so reaching zero never makes Hermes claim that the model has unloaded. Cloud routes and non-HTTP local transports are not probed, and the entire widget is omitted when the terminal is too narrow.
 
 ### File-mutation verifier
 
