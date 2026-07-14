@@ -7,9 +7,57 @@ import ``main`` (cycle avoidance).
 
 from __future__ import annotations
 
+import argparse
 from typing import Callable
 
 from hermes_cli.subcommands._shared import add_accept_hooks_flag
+
+
+def _add_guardrail_args(parser) -> None:
+    """Add optional per-job safety flags without manufacturing defaults."""
+    for name in (
+        "max-iterations",
+        "max-tokens",
+        "max-duration-seconds",
+        "max-tool-output-bytes",
+        "max-total-tool-output-bytes",
+        "max-tool-calls",
+        "max-files-read",
+    ):
+        parser.add_argument(f"--{name}", type=int)
+    parser.add_argument(
+        "--reasoning-effort",
+        choices=(
+            "none", "false", "disabled", "minimal", "low", "medium",
+            "high", "xhigh", "max", "ultra",
+        ),
+    )
+    for name in (
+        "script-fail-closed",
+        "skip-context-files",
+        "terminal-sandbox",
+        "restrict-file-tools-to-workdir",
+    ):
+        parser.add_argument(
+            f"--{name}",
+            action=argparse.BooleanOptionalAction,
+            default=None,
+        )
+
+
+def _add_enabled_toolsets_arg(parser) -> None:
+    parser.add_argument(
+        "--enabled-toolset",
+        "--enabled-toolsets",
+        dest="enabled_toolsets",
+        action="append",
+        help=(
+            "Restrict the job to toolsets (repeatable; comma-separated values "
+            "are also accepted). Guarded jobs require exactly 'file' with "
+            "--restrict-file-tools-to-workdir or 'terminal' with "
+            "--terminal-sandbox."
+        ),
+    )
 
 
 def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
@@ -105,6 +153,8 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         dest="model_provider",
         help="Inference provider paired with --model (e.g. 'openrouter', 'nous').",
     )
+    _add_enabled_toolsets_arg(cron_create)
+    _add_guardrail_args(cron_create)
 
     # cron edit
     cron_edit = cron_subparsers.add_parser(
@@ -197,6 +247,8 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         dest="model_provider",
         help="Inference provider paired with --model. Pass empty string to clear.",
     )
+    _add_enabled_toolsets_arg(cron_edit)
+    _add_guardrail_args(cron_edit)
 
     # lifecycle actions
     cron_pause = cron_subparsers.add_parser("pause", help="Pause a scheduled job")
