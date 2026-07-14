@@ -2479,11 +2479,21 @@ class SessionStore:
         state.db is the canonical store. The legacy JSONL fallback was removed
         in spec 002 — pre-DB sessions on existing disks have already been
         migrated (their DB row holds the full message history).
+
+        Observed messages from compression-ancestor sessions are prepended so
+        that observed context (e.g. unaddressed media in a Telegram group) is
+        not silently dropped when a compression split creates a new session.
         """
         if not self._db:
             return []
         try:
-            return self._db.get_messages_as_conversation(session_id)
+            messages = self._db.get_messages_as_conversation(session_id)
+            get_ancestor_observed = getattr(self._db, "get_ancestor_observed_messages", None)
+            if get_ancestor_observed:
+                ancestor_observed = get_ancestor_observed(session_id)
+                if ancestor_observed:
+                    messages = ancestor_observed + messages
+            return messages
         except Exception as e:
             logger.debug("Could not load messages from DB: %s", e)
             return []
