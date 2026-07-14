@@ -76,6 +76,14 @@ def auth_adapter():
     return _make_adapter(api_key="sk-secret")
 
 
+@pytest.fixture
+def tmp_cron_dir(tmp_path, monkeypatch):
+    monkeypatch.setattr("cron.jobs.CRON_DIR", tmp_path / "cron")
+    monkeypatch.setattr("cron.jobs.JOBS_FILE", tmp_path / "cron" / "jobs.json")
+    monkeypatch.setattr("cron.jobs.OUTPUT_DIR", tmp_path / "cron" / "output")
+    return tmp_path
+
+
 # ---------------------------------------------------------------------------
 # 1. test_list_jobs
 # ---------------------------------------------------------------------------
