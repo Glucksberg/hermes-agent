@@ -661,6 +661,320 @@ class TestLoadTranscriptDBOnly:
         assert result[0]["content"] == "db-q"
         assert result[1]["content"] == "db-a"
 
+    def test_load_transcript_keeps_messages_when_db_lacks_ancestor_helper(self, tmp_path):
+        config = GatewayConfig()
+        store = SessionStore(sessions_dir=tmp_path, config=config)
+        store._db = MagicMock(spec=["get_messages_as_conversation"])
+        store._db.get_messages_as_conversation.return_value = [
+            {"role": "user", "content": "db-q"},
+        ]
+
+        result = store.load_transcript("session_without_helper")
+
+        assert result == [{"role": "user", "content": "db-q"}]
+
+    def test_load_transcript_prepends_observed_compression_ancestors(self, tmp_path, monkeypatch):
+        import hermes_state
+        monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
+        config = GatewayConfig()
+        store = SessionStore(sessions_dir=tmp_path, config=config)
+
+        parent = "parent_session"
+        child = "child_session"
+        store._db.create_session(session_id=parent, source="gateway", model="m")
+        store._db.append_message(
+            session_id=parent,
+            role="user",
+            content="[Alice|111]\n[audio 'voice.ogg' saved at: /tmp/audio.ogg]",
+            observed=True,
+            platform_message_id="tg-1",
+        )
+        store._db.append_message(
+            session_id=parent,
+            role="user",
+            content="ordinary parent turn",
+            observed=False,
+        )
+        store._db.end_session(parent, "compression")
+        store._db.create_session(
+            session_id=child,
+            source="gateway",
+            model="m",
+            parent_session_id=parent,
+        )
+        store._db.append_message(session_id=child, role="user", content="current child turn")
+
+        result = store.load_transcript(child)
+
+        assert [msg["content"] for msg in result] == [
+            "[Alice|111]\n[audio 'voice.ogg' saved at: /tmp/audio.ogg]",
+            "current child turn",
+        ]
+        assert result[0]["observed"] is True
+        assert result[0]["message_id"] == "tg-1"
+
+    def test_load_transcript_ignores_non_compression_parent_observed_messages(self, tmp_path, monkeypatch):
+        import hermes_state
+        monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
+        config = GatewayConfig()
+        store = SessionStore(sessions_dir=tmp_path, config=config)
+
+        parent = "parent_session"
+        child = "child_session"
+        store._db.create_session(session_id=parent, source="gateway", model="m")
+        store._db.append_message(
+            session_id=parent,
+            role="user",
+            content="delegated parent context",
+            observed=True,
+        )
+        store._db.end_session(parent, "user_exit")
+        store._db.create_session(
+            session_id=child,
+            source="gateway",
+            model="m",
+            parent_session_id=parent,
+        )
+        store._db.append_message(session_id=child, role="user", content="current child turn")
+
+        result = store.load_transcript(child)
+
+        assert [msg["content"] for msg in result] == ["current child turn"]
+
+    def test_load_transcript_bounds_observed_context_across_compression_ancestors(
+        self, tmp_path, monkeypatch
+    ):
+        import hermes_state
+
+        monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
+        store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+        limit = hermes_state.MAX_OBSERVED_CONTEXT_MESSAGES
+        root = "bounded_root"
+        middle = "bounded_middle"
+        child = "bounded_child"
+        root_count = limit // 2 + 2
+
+        store._db.create_session(session_id=root, source="gateway", model="m")
+        for index in range(root_count):
+            store._db.append_message(
+                session_id=root,
+                role="user",
+                content=f"observed-{index:03d}",
+                observed=True,
+            )
+        store._db.end_session(root, "compression")
+
+        store._db.create_session(
+            session_id=middle,
+            source="gateway",
+            model="m",
+            parent_session_id=root,
+        )
+        for index in range(root_count, limit + 5):
+            store._db.append_message(
+                session_id=middle,
+                role="user",
+                content=f"observed-{index:03d}",
+                observed=True,
+            )
+        store._db.end_session(middle, "compression")
+        store._db.create_session(
+            session_id=child,
+            source="gateway",
+            model="m",
+            parent_session_id=middle,
+        )
+        store._db.append_message(
+            session_id=child,
+            role="user",
+            content="current child turn",
+        )
+
+        result = store.load_transcript(child)
+
+        assert [message["content"] for message in result[:-1]] == [
+            f"observed-{index:03d}" for index in range(5, limit + 5)
+        ]
+        assert len(result[:-1]) == limit
+        assert result[-1]["content"] == "current child turn"
+
+    @pytest.mark.parametrize(
+        ("platform", "channel_prompt"),
+        [
+            (Platform.TELEGRAM, "observed Telegram group context"),
+            (Platform.MATRIX, "observed Matrix room context"),
+        ],
+        ids=["telegram-shared-session", "matrix-shared-session"],
+    )
+    def test_passive_observed_context_is_bounded_before_first_agent_turn(
+        self, tmp_path, monkeypatch, platform, channel_prompt
+    ):
+        import hermes_state
+        from gateway.run import _build_gateway_agent_history
+
+        monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
+        store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+        limit = hermes_state.MAX_OBSERVED_CONTEXT_MESSAGES
+        source = SessionSource(
+            platform=platform,
+            chat_id="shared-room",
+            chat_type="group",
+        )
+        other_source = SessionSource(
+            platform=platform,
+            chat_id="other-room",
+            chat_type="group",
+        )
+        session = store.get_or_create_session(source)
+        other_session = store.get_or_create_session(other_source)
+
+        store.append_to_transcript(
+            session.session_id,
+            {"role": "assistant", "content": "keep-target-non-observed"},
+        )
+        store.append_to_transcript(
+            other_session.session_id,
+            {"role": "user", "content": "keep-other-observed", "observed": True},
+        )
+        store.append_to_transcript(
+            other_session.session_id,
+            {"role": "assistant", "content": "keep-other-non-observed"},
+        )
+        inserted = limit + 3
+        for index in range(inserted):
+            store.append_to_transcript(
+                session.session_id,
+                {
+                    "role": "user",
+                    "content": f"passive-{index:03d}",
+                    "observed": True,
+                    "message_id": f"{platform.value}-{index:03d}",
+                },
+            )
+
+        active_rows = store._db.get_messages(session.session_id)
+        active_observed = [row for row in active_rows if row["observed"]]
+        history = store.load_transcript(session.session_id)
+        _agent_history, observed_prompt = _build_gateway_agent_history(
+            history,
+            channel_prompt=channel_prompt,
+        )
+        prompt_rows = str(observed_prompt).splitlines() if observed_prompt else []
+        other_rows = store._db.get_messages(other_session.session_id)
+        expected_newest = [f"passive-{index:03d}" for index in range(3, inserted)]
+
+        assert {
+            "active_observed_count": len(active_observed),
+            "active_observed_contents": [row["content"] for row in active_observed],
+            "prompt_observed_count": len(prompt_rows),
+            "prompt_observed_contents": prompt_rows,
+            "target_non_observed": [
+                row["content"] for row in active_rows if not row["observed"]
+            ],
+            "other_session_contents": [row["content"] for row in other_rows],
+        } == {
+            "active_observed_count": limit,
+            "active_observed_contents": expected_newest,
+            "prompt_observed_count": limit,
+            "prompt_observed_contents": expected_newest,
+            "target_non_observed": ["keep-target-non-observed"],
+            "other_session_contents": [
+                "keep-other-observed",
+                "keep-other-non-observed",
+            ],
+        }
+
+    @pytest.mark.parametrize(
+        "channel_prompt",
+        [
+            "observed Telegram group context",
+            "observed Matrix room context",
+        ],
+    )
+    def test_prompt_defensively_bounds_legacy_oversized_observed_history(
+        self, channel_prompt
+    ):
+        import hermes_state
+        from gateway.run import _build_gateway_agent_history
+
+        limit = hermes_state.MAX_OBSERVED_CONTEXT_MESSAGES
+        history = [
+            {"role": "assistant", "content": "keep-agent-history"},
+            *[
+                {
+                    "role": "user",
+                    "content": f"legacy-passive-{index:03d}",
+                    "observed": True,
+                }
+                for index in range(limit + 3)
+            ],
+        ]
+
+        agent_history, observed_prompt = _build_gateway_agent_history(
+            history,
+            channel_prompt=channel_prompt,
+        )
+
+        assert agent_history == [
+            {"role": "assistant", "content": "keep-agent-history"}
+        ]
+        assert str(observed_prompt).splitlines() == [
+            f"legacy-passive-{index:03d}" for index in range(3, limit + 3)
+        ]
+
+    def test_load_transcript_keeps_observed_context_across_in_place_compaction(
+        self, tmp_path, monkeypatch
+    ):
+        import hermes_state
+
+        monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
+        store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+        session_id = "in_place_session"
+        limit = hermes_state.MAX_OBSERVED_CONTEXT_MESSAGES
+        store._db.create_session(session_id=session_id, source="gateway", model="m")
+        for index in range(limit + 5):
+            store._db.append_message(
+                session_id=session_id,
+                role="user",
+                content=f"observed-{index:03d}",
+                observed=True,
+                platform_message_id=f"tg-{index:03d}",
+            )
+        store._db.append_message(
+            session_id=session_id,
+            role="user",
+            content="ordinary turn",
+        )
+
+        store._db.archive_and_compact(
+            session_id,
+            [{"role": "assistant", "content": "first compacted summary"}],
+        )
+        first_result = store.load_transcript(session_id)
+        retained_for_second_compaction = [
+            dict(message) for message in first_result if message.get("observed")
+        ]
+        store._db.archive_and_compact(
+            session_id,
+            [
+                *retained_for_second_compaction,
+                {"role": "assistant", "content": "second compacted summary"},
+            ],
+        )
+
+        result = store.load_transcript(session_id)
+
+        assert [message["content"] for message in first_result[:-1]] == [
+            f"observed-{index:03d}" for index in range(5, limit + 5)
+        ]
+        assert [message["content"] for message in result[:-1]] == [
+            f"observed-{index:03d}" for index in range(5, limit + 5)
+        ]
+        assert len(result[:-1]) == limit
+        assert result[-1]["content"] == "second compacted summary"
+        assert result[0]["observed"] is True
+        assert result[0]["message_id"] == "tg-005"
+
 
 class TestSessionStoreSwitchSession:
     """Regression coverage for gateway /resume session switching semantics."""
