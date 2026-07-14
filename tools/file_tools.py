@@ -16,6 +16,7 @@ from tools.file_operations import (
     ShellFileOperations,
     normalize_read_pagination,
     normalize_search_pagination,
+    restricted_cron_file_diagnostics,
 )
 from tools import file_state
 from agent.redact import redact_sensitive_text
@@ -24,6 +25,28 @@ logger = logging.getLogger(__name__)
 
 
 _EXPECTED_WRITE_ERRNOS = {errno.EACCES, errno.EPERM, errno.EROFS}
+
+
+def _file_diagnostics_context(task_id: str):
+    """Return the diagnostics policy active for this task at execution time."""
+    try:
+        from tools.terminal_tool import get_guarded_cron_env, resolve_task_overrides
+
+        marker = resolve_task_overrides(task_id).get(
+            "cron_restricted_file_tools"
+        )
+        guarded_env = get_guarded_cron_env(task_id)
+    except Exception:
+        marker = None
+        guarded_env = None
+    if marker is True or getattr(
+        guarded_env, "_hermes_external_diagnostics_disabled", False
+    ) is True:
+        return restricted_cron_file_diagnostics()
+
+    from contextlib import nullcontext
+
+    return nullcontext()
 
 
 def _expand_tilde(path: str) -> str:
@@ -173,19 +196,19 @@ def _terminal_env_type_for_task(task_id: str = "default") -> str:
         from tools.terminal_tool import (
             _active_environments,
             _env_lock,
+            _resolve_environment_task_id,
             _get_env_config,
-            _resolve_container_task_id,
         )
 
         try:
-            container_key = _resolve_container_task_id(task_id)
+            container_key = _resolve_environment_task_id(task_id)
         except Exception:
             container_key = task_id
         with _env_lock:
-            env = _active_environments.get(container_key) or _active_environments.get(task_id)
+            env = _active_environments.get(container_key)
         if env is not None:
             name = env.__class__.__name__.lower()
-            if "local" in name:
+            if "local" in name or "cronunshare" in name:
                 return "local"
             if "ssh" in name:
                 return "ssh"
@@ -630,16 +653,16 @@ def _get_container_mirror_prefix_for_task(task_id: str = "default") -> str | Non
             _active_environments,
             _env_lock,
             _get_env_config,
-            _resolve_container_task_id,
+            _resolve_environment_task_id,
         )
 
-        container_key = _resolve_container_task_id(task_id)
+        container_key = _resolve_environment_task_id(task_id)
     except Exception:
         return None
 
     try:
         with _env_lock:
-            env = _active_environments.get(container_key) or _active_environments.get(task_id)
+            env = _active_environments.get(container_key)
 
         if env is not None:
             if env.__class__.__name__ == "DockerEnvironment" and bool(
@@ -935,24 +958,23 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
     Thread-safe: uses the same per-task creation locks as terminal_tool to
     prevent duplicate sandbox creation from concurrent tool calls.
 
-    Note: subagent task_ids are collapsed to "default" via
-    ``_resolve_container_task_id`` so delegate_task children share the
-    parent's container and its cached file_ops. RL/benchmark task_ids with
-    a registered env override keep their isolation.
+    Note: ordinary subagent task_ids are collapsed to "default" so children
+    share the parent's container and cached file_ops. RL/benchmark overrides
+    and raw-ID guarded cron environments keep their isolation.
     """
     from tools.terminal_tool import (
         _active_environments, _env_lock, _create_environment,
         _get_env_config, _last_activity, _start_cleanup_thread,
         _creation_locks,
         _creation_locks_lock,
-        _resolve_container_task_id,
+        _resolve_environment_task_id,
         _is_unusable_container_cwd,
         _CONTAINER_BACKENDS,
     )
     import time
 
     raw_task_id = task_id or "default"
-    task_id = _resolve_container_task_id(raw_task_id)
+    task_id = _resolve_environment_task_id(raw_task_id)
 
     # Fast path: check cache -- but also verify the underlying environment
     # is still alive (it may have been killed by the cleanup thread).
@@ -1605,7 +1627,8 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
         if _resolved is None:
             stale_warning = _check_file_staleness(path, task_id)
             file_ops = _get_file_ops(task_id)
-            result = file_ops.write_file(path, content)
+            with _file_diagnostics_context(task_id):
+                result = file_ops.write_file(path, content)
             result_dict = result.to_dict()
             if stale_warning:
                 result_dict["_warning"] = stale_warning
@@ -1626,7 +1649,8 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
             # terminal's cwd (the worktree-cwd bug). Lowest priority of the three.
             cwd_warning = _path_resolution_warning(path, Path(_resolved), task_id)
             file_ops = _get_file_ops(task_id)
-            result = file_ops.write_file(_resolved, content)
+            with _file_diagnostics_context(task_id):
+                result = file_ops.write_file(_resolved, content)
             result_dict = result.to_dict()
             effective_warning = cross_warning or stale_warning or cwd_warning
             if effective_warning:
@@ -1771,11 +1795,15 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                 # path would let the two layers disagree about which file is
                 # being edited.
                 _replace_target = _path_to_resolved.get(path) or path
-                result = file_ops.patch_replace(_replace_target, old_string, new_string, replace_all)
+                with _file_diagnostics_context(task_id):
+                    result = file_ops.patch_replace(
+                        _replace_target, old_string, new_string, replace_all
+                    )
             elif mode == "patch":
                 if not patch:
                     return tool_error("patch content required")
-                result = file_ops.patch_v4a(patch)
+                with _file_diagnostics_context(task_id):
+                    result = file_ops.patch_v4a(patch)
             else:
                 return tool_error(f"Unknown mode: {mode}")
 

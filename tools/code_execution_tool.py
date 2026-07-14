@@ -1195,6 +1195,23 @@ def execute_code(
     if not code or not code.strip():
         return tool_error("No code provided.")
 
+    # Guarded cron jobs register a raw-ID terminal environment whose filesystem,
+    # process, and output counters are the security boundary.  execute_code's
+    # local path spawns a host Python process and its remote RPC path maintains
+    # independent counters, so neither can safely participate in that boundary.
+    # Fail closed before approval or any subprocess setup.
+    from tools.terminal_tool import get_guarded_cron_env
+    if get_guarded_cron_env(task_id) is not None:
+        return json.dumps({
+            "status": "error",
+            "error": (
+                "execute_code is disabled for guarded cron environments; "
+                "use the terminal and file tools in the registered cron sandbox."
+            ),
+            "tool_calls_made": 0,
+            "duration_seconds": 0,
+        }, ensure_ascii=False)
+
     # Dispatch: remote backends use file-based RPC, local uses UDS
     from tools.terminal_tool import _get_env_config, _docker_has_host_access
     _env_config = _get_env_config()

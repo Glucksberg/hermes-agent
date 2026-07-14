@@ -5523,6 +5523,19 @@ def refresh_agent_mcp_tools(
     # this rebuild actually appended (matching agent_init's dedup-aware add).
     staged_engine_names = _reinject_post_build_tools(agent, new_defs, new_names)
 
+    # Guarded cron agents carry an immutable name boundary established after
+    # construction. A live-registry refresh must not re-expand their static
+    # file/terminal toolset name and reintroduce same-toolset plugin entries.
+    exact_names = getattr(agent, "_cron_exact_tool_names", None)
+    if isinstance(exact_names, frozenset):
+        new_defs = [
+            tool
+            for tool in new_defs
+            if tool.get("function", {}).get("name") in exact_names
+        ]
+        new_names.intersection_update(exact_names)
+        staged_engine_names.intersection_update(exact_names)
+
     # Single atomic read-diff-publish so the returned ``added`` is consistent
     # with what was actually published, even under concurrent callers, and a
     # stale (older-generation) rebuild can't overwrite a newer published one.

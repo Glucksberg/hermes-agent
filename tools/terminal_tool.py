@@ -1207,6 +1207,36 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
     return "default"
 
 
+def _is_guarded_cron_environment(env: Any) -> bool:
+    """Return whether *env* is the fail-closed environment of a cron run."""
+    return getattr(env, "_hermes_guarded_cron", False) is True
+
+
+def _resolve_environment_task_id(task_id: Optional[str]) -> str:
+    """Resolve the active-environment key, preserving guarded cron isolation.
+
+    Ordinary sessions retain the historical collapsed ``"default"`` container
+    behavior.  A guarded cron environment is explicitly registered under the
+    raw run task ID, however, and must win even when a default environment is
+    already live; otherwise preflight checks and execution target different
+    filesystems.
+    """
+    raw = task_id or "default"
+    with _env_lock:
+        raw_env = _active_environments.get(raw)
+    if _is_guarded_cron_environment(raw_env):
+        return raw
+    return _resolve_container_task_id(raw)
+
+
+def get_guarded_cron_env(task_id: Optional[str]):
+    """Return the raw-ID guarded cron environment, or ``None``."""
+    raw = task_id or "default"
+    with _env_lock:
+        env = _active_environments.get(raw)
+    return env if _is_guarded_cron_environment(env) else None
+
+
 def resolve_task_overrides(task_id: Optional[str]) -> Dict[str, Any]:
     """Return the env overrides for *task_id*, raw key first then collapsed.
 
@@ -1734,9 +1764,9 @@ def _stop_cleanup_thread():
 
 def get_active_env(task_id: str):
     """Return the active BaseEnvironment for *task_id*, or None."""
-    lookup = _resolve_container_task_id(task_id)
+    lookup = _resolve_environment_task_id(task_id)
     with _env_lock:
-        return _active_environments.get(lookup) or _active_environments.get(task_id)
+        return _active_environments.get(lookup)
 
 
 def is_persistent_env(task_id: str) -> bool:
@@ -2161,7 +2191,25 @@ def terminal_tool(
         # task_ids collapse back to "default" so the top-level agent and
         # every delegate_task child share one container; only task_ids with
         # a registered env override (RL benchmarks) get isolated sandboxes.
-        effective_task_id = _resolve_container_task_id(task_id)
+        effective_task_id = _resolve_environment_task_id(task_id)
+
+        # Guarded cron foreground commands execute through the registered
+        # environment and are safe. Background/PTY execution is not: the local
+        # path jumps to the host process registry (spawn_local), while the
+        # registry and PTY lifecycle are not owned by the cron sandbox. Refuse
+        # these modes before environment creation or process dispatch.
+        guarded_cron_env = get_guarded_cron_env(task_id)
+        if guarded_cron_env is not None and (background or pty):
+            return json.dumps({
+                "output": "",
+                "exit_code": -1,
+                "error": (
+                    "Guarded cron environments allow foreground terminal "
+                    "commands only; background, PTY, and process-registry "
+                    "execution are disabled."
+                ),
+                "status": "error",
+            }, ensure_ascii=False)
 
         # Check per-task overrides (set by environments like TerminalBench2Env)
         # before falling back to global env var config. ``resolve_task_overrides``

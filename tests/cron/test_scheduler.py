@@ -77,6 +77,82 @@ class TestPerJobToolsetMcpMerge:
         assert m_platform.call_args[0][1] == "cron"
         assert set(result) == set(sentinel)
 
+    def test_guarded_job_requires_explicit_toolset_allowlist(self):
+        with pytest.raises(RuntimeError, match="explicit enabled_toolsets"):
+            _resolve_cron_enabled_toolsets({"max_tokens": 256}, self.CFG)
+
+    def test_guarded_web_toolset_fails_closed(self):
+        with pytest.raises(RuntimeError, match="exactly one execution posture"):
+            _resolve_cron_enabled_toolsets(
+                {"max_tokens": 256, "enabled_toolsets": ["web", "file"]},
+                {
+                    **self.CFG,
+                    "platform_toolsets": {"cron": ["web", "host-shell"]},
+                },
+            )
+
+    @pytest.mark.parametrize(
+        "job,expected",
+        [
+            (
+                {
+                    "max_tokens": 256,
+                    "enabled_toolsets": ["file"],
+                    "restrict_file_tools_to_workdir": True,
+                },
+                ["file"],
+            ),
+            (
+                {
+                    "max_tokens": 256,
+                    "enabled_toolsets": ["terminal"],
+                    "terminal_sandbox": True,
+                },
+                ["terminal"],
+            ),
+        ],
+    )
+    def test_guarded_job_accepts_only_exact_execution_postures(self, job, expected):
+        assert _resolve_cron_enabled_toolsets(job, self.CFG) == expected
+
+    @pytest.mark.parametrize(
+        "job",
+        [
+            {"max_tokens": 256, "enabled_toolsets": ["file"]},
+            {
+                "max_tokens": 256,
+                "enabled_toolsets": ["file"],
+                "restrict_file_tools_to_workdir": True,
+                "terminal_sandbox": True,
+            },
+            {"max_tokens": 256, "enabled_toolsets": ["terminal"]},
+            {
+                "max_tokens": 256,
+                "enabled_toolsets": ["terminal"],
+                "terminal_sandbox": True,
+                "restrict_file_tools_to_workdir": True,
+            },
+            {
+                "max_tokens": 256,
+                "enabled_toolsets": ["file", "terminal"],
+                "terminal_sandbox": True,
+            },
+        ],
+    )
+    def test_guarded_job_rejects_every_other_execution_posture(self, job):
+        with pytest.raises(RuntimeError, match="exactly one execution posture"):
+            _resolve_cron_enabled_toolsets(job, self.CFG)
+
+    def test_guarded_job_rejects_custom_or_mcp_toolset(self):
+        with pytest.raises(RuntimeError, match="exactly one execution posture"):
+            _resolve_cron_enabled_toolsets(
+                {
+                    "max_tokens": 256,
+                    "enabled_toolsets": ["web", "finnhub"],
+                },
+                self.CFG,
+            )
+
 
 class TestResolveOrigin:
     def test_full_origin(self):

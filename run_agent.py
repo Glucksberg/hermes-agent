@@ -488,6 +488,13 @@ class AIAgent:
         checkpoint_max_total_size_mb: int = 500,
         checkpoint_max_file_size_mb: int = 10,
         pass_session_id: bool = False,
+        max_tool_output_bytes: Optional[int] = None,
+        max_total_tool_output_bytes: Optional[int] = None,
+        max_tool_calls: Optional[int] = None,
+        max_files_read: Optional[int] = None,
+        restrict_file_tools_to_workdir: bool = False,
+        file_tool_workdir: Optional[str] = None,
+        cron_hard_max_tokens: Optional[int] = None,
     ):
         """Forwarder — see ``agent.agent_init.init_agent``."""
         from agent.agent_init import init_agent
@@ -503,6 +510,13 @@ class AIAgent:
             args=args,
             model=model,
             max_iterations=max_iterations,
+            max_tool_output_bytes=max_tool_output_bytes,
+            max_total_tool_output_bytes=max_total_tool_output_bytes,
+            max_tool_calls=max_tool_calls,
+            max_files_read=max_files_read,
+            restrict_file_tools_to_workdir=restrict_file_tools_to_workdir,
+            file_tool_workdir=file_tool_workdir,
+            cron_hard_max_tokens=cron_hard_max_tokens,
             tool_delay=tool_delay,
             enabled_toolsets=enabled_toolsets,
             disabled_toolsets=disabled_toolsets,

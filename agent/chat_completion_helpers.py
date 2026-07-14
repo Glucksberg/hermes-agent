@@ -52,6 +52,90 @@ _OPENROUTER_PROVIDER_SORT_VALUES = {"throughput", "latency", "price"}
 # narrower non-rate-limit case.  See issue #24996.
 _FALLBACK_EXHAUSTED_COOLDOWN_S = 5.0
 
+_OUTPUT_TOKEN_CAP_KEYS = (
+    "max_tokens",
+    "max_completion_tokens",
+    "max_output_tokens",
+    "maxTokens",
+    "maxCompletionTokens",
+    "maxOutputTokens",
+)
+
+
+def clamp_cron_hard_token_cap(agent, api_kwargs: dict) -> dict:
+    """Clamp every emitted request-level output budget to the cron ceiling.
+
+    This runs after provider profiles and request overrides have been merged,
+    and again at the execution seam after middleware, so retries, fallback
+    transports, and plugins cannot raise an explicit per-job ceiling.
+    """
+    cap = getattr(agent, "_cron_hard_max_tokens", None)
+    if type(cap) is not int or cap <= 0 or not isinstance(api_kwargs, dict):
+        return api_kwargs
+
+    found_cap = False
+
+    def _clamp_mapping(mapping: Any) -> None:
+        nonlocal found_cap
+        if not isinstance(mapping, dict):
+            return
+        for key in _OUTPUT_TOKEN_CAP_KEYS:
+            if key not in mapping:
+                continue
+            found_cap = True
+            value = mapping[key]
+            if type(value) is int and value > 0:
+                mapping[key] = min(value, cap)
+            else:
+                # None/non-numeric request overrides can mean "provider
+                # default" (effectively unbounded relative to the job).
+                mapping[key] = cap
+        for container_key in ("extra_body", "inferenceConfig", "generationConfig"):
+            _clamp_mapping(mapping.get(container_key))
+
+    _clamp_mapping(api_kwargs)
+    if not found_cap:
+        api_mode = getattr(agent, "api_mode", None)
+        if api_mode == "codex_responses":
+            is_codex_backend = (
+                getattr(agent, "provider", None) == "openai-codex"
+                or (
+                    getattr(agent, "_base_url_hostname", None) == "chatgpt.com"
+                    and "/backend-api/codex"
+                    in str(getattr(agent, "_base_url_lower", ""))
+                )
+            )
+            if is_codex_backend:
+                raise RuntimeError(
+                    "This provider transport cannot enforce cron max_tokens; "
+                    "refusing an unbounded guarded cron request."
+                )
+            api_kwargs["max_output_tokens"] = cap
+        elif api_mode == "codex_app_server":
+            raise RuntimeError(
+                "This provider transport cannot enforce cron max_tokens; "
+                "refusing an unbounded guarded cron request."
+            )
+        elif api_mode == "bedrock_converse":
+            inference_config = api_kwargs.setdefault("inferenceConfig", {})
+            if not isinstance(inference_config, dict):
+                raise RuntimeError(
+                    "Bedrock request cannot enforce cron max_tokens: invalid "
+                    "inferenceConfig."
+                )
+            inference_config["maxTokens"] = cap
+        elif api_mode == "anthropic_messages":
+            api_kwargs["max_tokens"] = cap
+        else:
+            token_param = agent._max_tokens_param(cap)
+            if not token_param:
+                raise RuntimeError(
+                    "This provider transport cannot enforce cron max_tokens; "
+                    "refusing an unbounded guarded cron request."
+                )
+            api_kwargs.update(token_param)
+    return api_kwargs
+
 
 def _ra():
     """Lazy ``run_agent`` reference.
@@ -252,6 +336,7 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
     abort, cancellation, and close semantics stay in the callers — this helper
     only issues the request.
     """
+    api_kwargs = clamp_cron_hard_token_cap(agent, api_kwargs)
     if agent.api_mode == "codex_responses":
         request_client = make_client("codex_stream_request")
         return agent._run_codex_stream(
@@ -828,7 +913,7 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
         ephemeral_out = getattr(agent, "_ephemeral_max_output_tokens", None)
         if ephemeral_out is not None:
             agent._ephemeral_max_output_tokens = None  # consume immediately
-        return _transport.build_kwargs(
+        return clamp_cron_hard_token_cap(agent, _transport.build_kwargs(
             model=agent.model,
             messages=anthropic_messages,
             tools=tools_for_api,
@@ -840,7 +925,7 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
             base_url=getattr(agent, "_anthropic_base_url", None),
             fast_mode=(agent.request_overrides or {}).get("speed") == "fast",
             drop_context_1m_beta=bool(getattr(agent, "_oauth_1m_beta_disabled", False)),
-        )
+        ))
 
     # AWS Bedrock native Converse API — bypasses the OpenAI client entirely.
     # The adapter handles message/tool conversion and boto3 calls directly.
@@ -848,14 +933,14 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
         _bt = agent._get_transport()
         region = getattr(agent, "_bedrock_region", None) or "us-east-1"
         guardrail = getattr(agent, "_bedrock_guardrail_config", None)
-        return _bt.build_kwargs(
+        return clamp_cron_hard_token_cap(agent, _bt.build_kwargs(
             model=agent.model,
             messages=api_messages,
             tools=tools_for_api,
             max_tokens=agent.max_tokens or 4096,
             region=region,
             guardrail_config=guardrail,
-        )
+        ))
 
     if agent.api_mode == "codex_responses":
         _ct = agent._get_transport()
@@ -905,7 +990,7 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
                     getattr(agent, "log_prefix", ""), exc,
                 )
 
-        return _ct.build_kwargs(
+        return clamp_cron_hard_token_cap(agent, _ct.build_kwargs(
             model=agent.model,
             messages=_msgs_for_codex,
             tools=tools_for_api,
@@ -921,7 +1006,7 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
             replay_encrypted_reasoning=bool(
                 getattr(agent, "_codex_reasoning_replay_enabled", True)
             ),
-        )
+        ))
 
     # ── chat_completions (default) ─────────────────────────────────────
     _ct = agent._get_transport()
@@ -1005,7 +1090,7 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
         # registered providers with profiles were bypassing the strip.
         api_messages = agent._prepare_messages_for_non_vision_model(api_messages)
 
-        return _ct.build_kwargs(
+        return clamp_cron_hard_token_cap(agent, _ct.build_kwargs(
             model=agent.model,
             messages=api_messages,
             tools=tools_for_api,
@@ -1025,7 +1110,7 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
             anthropic_max_output=_ant_max,
             supports_reasoning=agent._supports_reasoning_extra_body(),
             qwen_session_metadata=_qwen_meta,
-        )
+        ))
 
     # ── Legacy flag path ────────────────────────────────────────────
     # Reached only when get_provider_profile() returns None — i.e. a
@@ -1037,7 +1122,7 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
     # Strip image parts for non-vision models (no-op when vision-capable).
     _msgs_for_chat = agent._prepare_messages_for_non_vision_model(api_messages)
 
-    return _ct.build_kwargs(
+    return clamp_cron_hard_token_cap(agent, _ct.build_kwargs(
         model=agent.model,
         messages=_msgs_for_chat,
         tools=tools_for_api,
@@ -1072,7 +1157,7 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
         lmstudio_reasoning_options=agent._lmstudio_reasoning_options_cached() if _is_lmstudio else None,
         anthropic_max_output=_ant_max,
         provider_name=agent.provider,
-    )
+    ))
 
 
 
@@ -1909,10 +1994,12 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                                max_tokens=agent.max_tokens, reasoning_config=agent.reasoning_config,
                                is_oauth=agent._is_anthropic_oauth,
                                preserve_dots=agent._anthropic_preserve_dots())
+                clamp_cron_hard_token_cap(agent, _ant_kw)
                 summary_response = agent._anthropic_messages_create(_ant_kw)
                 _summary_result = _tsum.normalize_response(summary_response, strip_tool_prefix=agent._is_anthropic_oauth)
                 final_response = (_summary_result.content or "").strip()
             else:
+                clamp_cron_hard_token_cap(agent, summary_kwargs)
                 summary_response = agent._ensure_primary_openai_client(reason="iteration_limit_summary").chat.completions.create(**summary_kwargs)
                 _summary_result = agent._get_transport().normalize_response(summary_response)
                 final_response = (_summary_result.content or "").strip()
@@ -1939,6 +2026,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                                 is_oauth=agent._is_anthropic_oauth,
                                 max_tokens=agent.max_tokens, reasoning_config=agent.reasoning_config,
                                 preserve_dots=agent._anthropic_preserve_dots())
+                clamp_cron_hard_token_cap(agent, _ant_kw2)
                 retry_response = agent._anthropic_messages_create(_ant_kw2)
                 _retry_result = _tretry.normalize_response(retry_response, strip_tool_prefix=agent._is_anthropic_oauth)
                 final_response = (_retry_result.content or "").strip()
@@ -1956,6 +2044,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 if summary_extra_body:
                     summary_kwargs["extra_body"] = summary_extra_body
 
+                clamp_cron_hard_token_cap(agent, summary_kwargs)
                 summary_response = agent._ensure_primary_openai_client(reason="iteration_limit_summary_retry").chat.completions.create(**summary_kwargs)
                 _retry_result = agent._get_transport().normalize_response(summary_response)
                 final_response = (_retry_result.content or "").strip()
@@ -2026,6 +2115,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     Falls back to _interruptible_api_call on provider errors indicating
     streaming is not supported.
     """
+    api_kwargs = clamp_cron_hard_token_cap(agent, api_kwargs)
     if agent._interrupt_requested:
         raise InterruptedError("Agent interrupted before streaming API call")
 

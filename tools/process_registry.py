@@ -2298,6 +2298,15 @@ def _redact_process_result(result: dict) -> dict:
 
 def _handle_process(args, **kw):
     task_id = kw.get("task_id")
+    # Guarded cron commands never enter the host-backed process registry. Keep
+    # every registry action fail-closed for the raw cron task key, including
+    # list/poll operations that could otherwise expose an unrelated session.
+    from tools.terminal_tool import get_guarded_cron_env
+    if get_guarded_cron_env(task_id) is not None:
+        return tool_error(
+            "Guarded cron environments disable background, PTY, and "
+            "process-registry operations; use foreground terminal commands."
+        )
     action = args.get("action", "")
     # Coerce to string — some models send session_id as an integer
     session_id = str(args.get("session_id", "")) if args.get("session_id") is not None else ""
