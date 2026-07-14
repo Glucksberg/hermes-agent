@@ -1099,6 +1099,16 @@ def _build_child_agent(
 
     delegation_cfg = _load_config()
 
+    cron_root = getattr(parent_agent, "_cron_guardrail_parent", None)
+    if cron_root is None and getattr(parent_agent, "platform", None) == "cron":
+        cron_root = parent_agent
+    cron_rooted = cron_root is not None and getattr(cron_root, "platform", None) == "cron"
+
+    if cron_rooted:
+        parent_max_iterations = getattr(parent_agent, "max_iterations", None)
+        if type(parent_max_iterations) is int and parent_max_iterations > 0:
+            max_iterations = min(max_iterations, parent_max_iterations)
+
     # When no explicit toolsets given, inherit from parent's enabled toolsets
     # so disabled tools (e.g. web) don't leak to subagents.
     # Note: enabled_toolsets=None means "all tools enabled" (the default),
@@ -1273,6 +1283,31 @@ def _build_child_agent(
     except Exception as exc:
         logger.debug("Could not load delegation reasoning_effort: %s", exc)
 
+    if cron_rooted:
+        parent_reasoning = getattr(parent_agent, "reasoning_config", None)
+        _reasoning_ranks = {
+            "minimal": 1,
+            "low": 2,
+            "medium": 3,
+            "high": 4,
+            "xhigh": 5,
+            "max": 6,
+            "ultra": 7,
+        }
+
+        def _reasoning_rank(config):
+            if not isinstance(config, dict):
+                return None
+            if config.get("enabled") is False:
+                return 0
+            effort = str(config.get("effort") or "medium").strip().lower()
+            return _reasoning_ranks.get(effort, 3)
+
+        parent_rank = _reasoning_rank(parent_reasoning)
+        child_rank = _reasoning_rank(child_reasoning)
+        if parent_rank is not None and (child_rank is None or child_rank > parent_rank):
+            child_reasoning = parent_reasoning
+
     # Inherit the parent's fallback provider chain so subagents can recover
     # from rate-limits and credential exhaustion exactly like the top-level
     # agent does.  _fallback_chain is a list accepted by AIAgent's
@@ -1313,6 +1348,19 @@ def _build_child_agent(
         if override_max_tokens is not None
         else getattr(parent_agent, "max_tokens", None)
     )
+    if cron_rooted:
+        hard_max_tokens = getattr(cron_root, "_cron_hard_max_tokens", None)
+        parent_max_tokens = getattr(parent_agent, "max_tokens", None)
+        if type(hard_max_tokens) is int and hard_max_tokens > 0:
+            if type(child_max_tokens) is int and child_max_tokens > 0:
+                child_max_tokens = min(child_max_tokens, hard_max_tokens)
+            else:
+                child_max_tokens = hard_max_tokens
+        elif type(parent_max_tokens) is int and parent_max_tokens > 0:
+            if type(child_max_tokens) is int and child_max_tokens > 0:
+                child_max_tokens = min(child_max_tokens, parent_max_tokens)
+            else:
+                child_max_tokens = parent_max_tokens
     child_optional_kwargs: Dict[str, Any] = {}
     if isinstance(child_max_tokens, int):
         child_optional_kwargs["max_tokens"] = child_max_tokens
@@ -1326,6 +1374,21 @@ def _build_child_agent(
         acp_command=effective_acp_command,
         acp_args=effective_acp_args,
         max_iterations=max_iterations,
+        max_tool_output_bytes=getattr(parent_agent, "max_tool_output_bytes", None),
+        max_total_tool_output_bytes=getattr(
+            parent_agent, "max_total_tool_output_bytes", None
+        ),
+        max_tool_calls=getattr(parent_agent, "max_tool_calls", None),
+        max_files_read=getattr(parent_agent, "max_files_read", None),
+        restrict_file_tools_to_workdir=getattr(
+            parent_agent, "restrict_file_tools_to_workdir", False
+        ),
+        file_tool_workdir=getattr(parent_agent, "file_tool_workdir", None),
+        cron_hard_max_tokens=(
+            getattr(cron_root, "_cron_hard_max_tokens", None)
+            if cron_rooted
+            else None
+        ),
 
         reasoning_config=child_reasoning,
         prefill_messages=getattr(parent_agent, "prefill_messages", None),
@@ -1354,10 +1417,23 @@ def _build_child_agent(
         ),
         openrouter_min_coding_score=child_openrouter_min_coding_score,
         tool_progress_callback=child_progress_cb,
-        iteration_budget=None,  # fresh budget per subagent
+        iteration_budget=(
+            getattr(parent_agent, "iteration_budget", None)
+            if cron_rooted
+            else None
+        ),
         **child_optional_kwargs,
     )
     child._print_fn = getattr(parent_agent, "_print_fn", None)
+    child._cron_guardrail_parent = (
+        cron_root
+        if cron_rooted
+        else (getattr(parent_agent, "_cron_guardrail_parent", None) or parent_agent)
+    )
+    child._preserve_iteration_budget = cron_rooted
+    child._cron_sandbox_task_id = getattr(
+        parent_agent, "_cron_sandbox_task_id", None
+    )
     # Now the child exists, its session id can ride on every relayed event
     # (including the spawn_requested below — first emit happens after this).
     child_session_ref["session_id"] = getattr(child, "session_id", "") or ""
@@ -1904,7 +1980,11 @@ def _run_single_child(
         # pre-built id is somehow missing.
         import uuid as _uuid
 
-        child_task_id = _subagent_id or f"subagent-{task_index}-{_uuid.uuid4().hex[:8]}"
+        child_task_id = (
+            getattr(child, "_cron_sandbox_task_id", None)
+            or _subagent_id
+            or f"subagent-{task_index}-{_uuid.uuid4().hex[:8]}"
+        )
         parent_task_id = getattr(parent_agent, "_current_task_id", None)
         wall_start = time.time()
         parent_reads_snapshot = (
@@ -1965,6 +2045,19 @@ def _run_single_child(
                 pass
 
             is_timeout = isinstance(_timeout_exc, (FuturesTimeoutError, TimeoutError))
+            _cron_root = getattr(child, "_cron_guardrail_parent", None)
+            _cron_rooted_timeout = is_timeout and (
+                getattr(parent_agent, "platform", None) == "cron"
+                or getattr(_cron_root, "platform", None) == "cron"
+            )
+            if _cron_rooted_timeout:
+                # A guarded cron owns its full delegated tree until every
+                # worker acknowledges termination. Python cannot kill a
+                # non-cooperative thread, so blocking here is the safe result.
+                try:
+                    _child_future.result()
+                except BaseException:
+                    pass
             duration = round(time.monotonic() - child_start, 2)
             logger.warning(
                 "Subagent %d %s after %.1fs",

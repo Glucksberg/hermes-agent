@@ -320,6 +320,32 @@ def _jobs_lock():
 # into output writes/deletes.
 _IMMUTABLE_JOB_FIELDS = frozenset({"id"})
 
+# Optional per-job safety controls deliberately remain absent from legacy job
+# records unless the caller explicitly supplies them. A sentinel is required
+# because ``None`` is invalid for every guardrail field and must not be confused
+# with omission.
+_GUARDRAIL_UNSET = Ellipsis
+_BOOLEAN_GUARDRAIL_FIELDS = frozenset({
+    "script_fail_closed",
+    "skip_context_files",
+    "terminal_sandbox",
+    "restrict_file_tools_to_workdir",
+})
+_POSITIVE_INTEGER_GUARDRAIL_FIELDS = frozenset({
+    "max_iterations",
+    "max_tokens",
+    "max_duration_seconds",
+    "max_tool_output_bytes",
+    "max_total_tool_output_bytes",
+    "max_tool_calls",
+    "max_files_read",
+})
+_GUARDRAIL_FIELDS = (
+    _BOOLEAN_GUARDRAIL_FIELDS
+    | _POSITIVE_INTEGER_GUARDRAIL_FIELDS
+    | {"reasoning_effort"}
+)
+
 
 def _job_output_dir(job_id: str) -> Path:
     """Resolve a job's output directory, rejecting any path-escape attempt.
@@ -927,6 +953,87 @@ def _normalize_workdir(workdir: Optional[str]) -> Optional[str]:
     return str(resolved)
 
 
+def _normalize_guardrail_updates(values: Dict[str, Any]) -> Dict[str, Any]:
+    """Validate explicitly supplied per-job guardrails without adding defaults."""
+    normalized: Dict[str, Any] = {}
+    for field in _BOOLEAN_GUARDRAIL_FIELDS:
+        value = values.get(field, _GUARDRAIL_UNSET)
+        if value is _GUARDRAIL_UNSET:
+            continue
+        if type(value) is not bool:
+            raise ValueError(f"Cron guardrail {field} must be a boolean")
+        normalized[field] = value
+    for field in _POSITIVE_INTEGER_GUARDRAIL_FIELDS:
+        value = values.get(field, _GUARDRAIL_UNSET)
+        if value is _GUARDRAIL_UNSET:
+            continue
+        if type(value) is not int or value <= 0:
+            raise ValueError(f"Cron guardrail {field} must be a positive integer")
+        normalized[field] = value
+    reasoning_effort = values.get("reasoning_effort", _GUARDRAIL_UNSET)
+    if reasoning_effort is not _GUARDRAIL_UNSET:
+        from hermes_constants import parse_reasoning_effort
+
+        if reasoning_effort is False:
+            normalized["reasoning_effort"] = False
+        elif (
+            type(reasoning_effort) is str
+            and parse_reasoning_effort(reasoning_effort) is not None
+        ):
+            normalized["reasoning_effort"] = reasoning_effort.strip().lower()
+        else:
+            raise ValueError(
+                "Cron guardrail reasoning_effort must be false or a supported "
+                "reasoning effort string"
+            )
+    return normalized
+
+
+def _normalize_enabled_toolsets(value: Any) -> Optional[List[str]]:
+    """Normalize the stored allowlist without treating a string as characters."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        raw_items = [value]
+    else:
+        try:
+            raw_items = list(value)
+        except TypeError as exc:
+            raise ValueError("Cron enabled_toolsets must be a list of names") from exc
+    normalized: List[str] = []
+    for item in raw_items:
+        name = str(item).strip()
+        if name and name not in normalized:
+            normalized.append(name)
+    return normalized or None
+
+
+def _guarded_cron_posture(job: Dict[str, Any]) -> Optional[str]:
+    """Validate and identify the exact execution posture of a guarded job."""
+    if not any(field in job for field in _GUARDRAIL_FIELDS):
+        return None
+
+    enabled_toolsets = _normalize_enabled_toolsets(job.get("enabled_toolsets"))
+    if not enabled_toolsets:
+        raise ValueError(
+            "Cron jobs with guardrails require an explicit enabled_toolsets allowlist"
+        )
+
+    terminal_sandbox = job.get("terminal_sandbox") is True
+    restrict_files = job.get("restrict_file_tools_to_workdir") is True
+    if enabled_toolsets == ["file"] and restrict_files and not terminal_sandbox:
+        return "file"
+    if enabled_toolsets == ["terminal"] and terminal_sandbox and not restrict_files:
+        return "terminal"
+    raise ValueError(
+        "Guarded cron jobs must select exactly one execution posture: "
+        "enabled_toolsets=['file'] with "
+        "restrict_file_tools_to_workdir=true and terminal_sandbox=false, or "
+        "enabled_toolsets=['terminal'] with terminal_sandbox=true and "
+        "restrict_file_tools_to_workdir=false"
+    )
+
+
 def _resolve_default_model_snapshot() -> Optional[str]:
     """Resolve the global default model the same way the cron ticker does.
 
@@ -1048,6 +1155,18 @@ def create_job(
     workdir: Optional[str] = None,
     no_agent: bool = False,
     attach_to_session: Optional[bool] = None,
+    script_fail_closed: Any = _GUARDRAIL_UNSET,
+    max_iterations: Any = _GUARDRAIL_UNSET,
+    max_tokens: Any = _GUARDRAIL_UNSET,
+    reasoning_effort: Any = _GUARDRAIL_UNSET,
+    max_duration_seconds: Any = _GUARDRAIL_UNSET,
+    max_tool_output_bytes: Any = _GUARDRAIL_UNSET,
+    max_total_tool_output_bytes: Any = _GUARDRAIL_UNSET,
+    skip_context_files: Any = _GUARDRAIL_UNSET,
+    terminal_sandbox: Any = _GUARDRAIL_UNSET,
+    max_tool_calls: Any = _GUARDRAIL_UNSET,
+    max_files_read: Any = _GUARDRAIL_UNSET,
+    restrict_file_tools_to_workdir: Any = _GUARDRAIL_UNSET,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -1119,11 +1238,32 @@ def create_job(
     normalized_base_url = _normalize_job_optional_text(base_url, strip_trailing_slash=True)
     normalized_script = str(script).strip() if isinstance(script, str) else None
     normalized_script = normalized_script or None
-    normalized_toolsets = [str(t).strip() for t in enabled_toolsets if str(t).strip()] if enabled_toolsets else None
-    normalized_toolsets = normalized_toolsets or None
+    normalized_toolsets = _normalize_enabled_toolsets(enabled_toolsets)
     normalized_workdir = _normalize_workdir(workdir)
     normalized_no_agent = bool(no_agent)
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
+    normalized_guardrails = _normalize_guardrail_updates({
+        "script_fail_closed": script_fail_closed,
+        "max_iterations": max_iterations,
+        "max_tokens": max_tokens,
+        "reasoning_effort": reasoning_effort,
+        "max_duration_seconds": max_duration_seconds,
+        "max_tool_output_bytes": max_tool_output_bytes,
+        "max_total_tool_output_bytes": max_total_tool_output_bytes,
+        "skip_context_files": skip_context_files,
+        "terminal_sandbox": terminal_sandbox,
+        "max_tool_calls": max_tool_calls,
+        "max_files_read": max_files_read,
+        "restrict_file_tools_to_workdir": restrict_file_tools_to_workdir,
+    })
+    if normalized_guardrails.get("terminal_sandbox") is True and not normalized_workdir:
+        raise ValueError("Cron guardrail terminal_sandbox=True requires workdir")
+    if normalized_guardrails.get("restrict_file_tools_to_workdir") is True and not normalized_workdir:
+        raise ValueError("Cron guardrail restrict_file_tools_to_workdir=True requires workdir")
+    _guarded_cron_posture({
+        **normalized_guardrails,
+        "enabled_toolsets": normalized_toolsets,
+    })
 
     # no_agent jobs are meaningless without a script — the script IS the job.
     # Surface this as a clear ValueError at create time so bad configs never
@@ -1214,6 +1354,7 @@ def create_job(
         "enabled_toolsets": normalized_toolsets,
         "workdir": normalized_workdir,
     }
+    job.update(normalized_guardrails)
     # Only persist attach_to_session when explicitly set, so existing jobs and
     # the common case stay byte-identical (absent key => fall back to the
     # global cron.mirror_delivery config, default off).
@@ -1285,6 +1426,7 @@ def list_jobs(include_disabled: bool = False) -> List[Dict[str, Any]]:
 
 def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Update a job by ID, refreshing derived schedule fields when needed."""
+    updates = dict(updates or {})
     # Block mutation of immutable fields. ``id`` in particular is a filesystem
     # path component under OUTPUT_DIR — letting an update change it leaks
     # path-escape values into output writes/deletes.
@@ -1308,6 +1450,32 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                     updates["workdir"] = None
                 else:
                     updates["workdir"] = _normalize_workdir(_wd)
+
+            guardrail_updates = _normalize_guardrail_updates(updates)
+            updates.update(guardrail_updates)
+            if "enabled_toolsets" in updates:
+                updates["enabled_toolsets"] = _normalize_enabled_toolsets(
+                    updates.get("enabled_toolsets")
+                )
+            if "terminal_sandbox" in updates or "workdir" in updates:
+                effective_terminal_sandbox = updates.get(
+                    "terminal_sandbox", job.get("terminal_sandbox", False)
+                )
+                effective_workdir = updates.get("workdir", job.get("workdir"))
+                if effective_terminal_sandbox is True and not effective_workdir:
+                    raise ValueError("Cron guardrail terminal_sandbox=True requires workdir")
+            if "restrict_file_tools_to_workdir" in updates or "workdir" in updates:
+                effective_file_restriction = updates.get(
+                    "restrict_file_tools_to_workdir",
+                    job.get("restrict_file_tools_to_workdir", False),
+                )
+                effective_workdir = updates.get("workdir", job.get("workdir"))
+                if effective_file_restriction is True and not effective_workdir:
+                    raise ValueError(
+                        "Cron guardrail restrict_file_tools_to_workdir=True requires workdir"
+                    )
+
+            _guarded_cron_posture({**job, **updates})
 
             previous_inference_axes = _normalized_inference_axes(job)
             updated = _apply_skill_fields({**job, **updates})

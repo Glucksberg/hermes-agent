@@ -48,6 +48,45 @@ def _cron_api(**kwargs):
     return json.loads(cronjob_tool(**kwargs))
 
 
+_GUARDRAIL_ARG_NAMES = (
+    "script_fail_closed",
+    "max_iterations",
+    "max_tokens",
+    "reasoning_effort",
+    "max_duration_seconds",
+    "max_tool_output_bytes",
+    "max_total_tool_output_bytes",
+    "max_tool_calls",
+    "max_files_read",
+    "skip_context_files",
+    "terminal_sandbox",
+    "restrict_file_tools_to_workdir",
+)
+
+
+def _guardrail_args(args) -> dict:
+    """Return only explicitly supplied CLI guardrails for back-compat."""
+    return {
+        name: value
+        for name in _GUARDRAIL_ARG_NAMES
+        if (value := getattr(args, name, None)) is not None
+    }
+
+
+def _enabled_toolset_args(args) -> dict:
+    """Normalize repeatable/comma-separated CLI values, preserving omission."""
+    raw_values = getattr(args, "enabled_toolsets", None)
+    if raw_values is None:
+        return {}
+    normalized = []
+    for raw in raw_values:
+        for item in str(raw).split(","):
+            name = item.strip()
+            if name and name not in normalized:
+                normalized.append(name)
+    return {"enabled_toolsets": normalized}
+
+
 def _active_cron_provider_name() -> str:
     """Name of the resolved cron scheduler provider ('builtin', 'chronos', …).
 
@@ -310,6 +349,8 @@ def cron_create(args):
         script=getattr(args, "script", None),
         workdir=getattr(args, "workdir", None),
         no_agent=getattr(args, "no_agent", False) or None,
+        **_enabled_toolset_args(args),
+        **_guardrail_args(args),
     )
     if not result.get("success"):
         print(color(f"Failed to create job: {result.get('error', 'unknown error')}", Colors.RED))
@@ -373,6 +414,8 @@ def cron_edit(args):
         script=getattr(args, "script", None),
         workdir=getattr(args, "workdir", None),
         no_agent=getattr(args, "no_agent", None),
+        **_enabled_toolset_args(args),
+        **_guardrail_args(args),
     )
     if not result.get("success"):
         print(color(f"Failed to update job: {result.get('error', 'unknown error')}", Colors.RED))

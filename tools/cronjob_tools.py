@@ -16,6 +16,21 @@ from hermes_constants import display_hermes_home
 
 logger = logging.getLogger(__name__)
 
+_GUARDRAIL_FIELDS = (
+    "script_fail_closed",
+    "max_iterations",
+    "max_tokens",
+    "reasoning_effort",
+    "max_duration_seconds",
+    "max_tool_output_bytes",
+    "max_total_tool_output_bytes",
+    "skip_context_files",
+    "terminal_sandbox",
+    "max_tool_calls",
+    "max_files_read",
+    "restrict_file_tools_to_workdir",
+)
+
 # Import from cron module (will be available when properly installed)
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -598,6 +613,9 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         result["enabled_toolsets"] = job["enabled_toolsets"]
     if job.get("workdir"):
         result["workdir"] = job["workdir"]
+    for field in _GUARDRAIL_FIELDS:
+        if field in job:
+            result[field] = job[field]
     return result
 
 
@@ -678,6 +696,18 @@ def cronjob(
     no_agent: Optional[bool] = None,
     attach_to_session: Optional[bool] = None,
     task_id: str = None,
+    script_fail_closed: Any = None,
+    max_iterations: Any = None,
+    max_tokens: Any = None,
+    reasoning_effort: Any = None,
+    max_duration_seconds: Any = None,
+    max_tool_output_bytes: Any = None,
+    max_total_tool_output_bytes: Any = None,
+    skip_context_files: Any = None,
+    terminal_sandbox: Any = None,
+    max_tool_calls: Any = None,
+    max_files_read: Any = None,
+    restrict_file_tools_to_workdir: Any = None,
 ) -> str:
     """Unified cron job management tool."""
     del task_id  # unused but kept for handler signature compatibility
@@ -733,6 +763,24 @@ def cronjob(
                             success=False,
                         )
 
+            guardrail_kwargs = {
+                field: value
+                for field, value in {
+                    "script_fail_closed": script_fail_closed,
+                    "max_iterations": max_iterations,
+                    "max_tokens": max_tokens,
+                    "reasoning_effort": reasoning_effort,
+                    "max_duration_seconds": max_duration_seconds,
+                    "max_tool_output_bytes": max_tool_output_bytes,
+                    "max_total_tool_output_bytes": max_total_tool_output_bytes,
+                    "skip_context_files": skip_context_files,
+                    "terminal_sandbox": terminal_sandbox,
+                    "max_tool_calls": max_tool_calls,
+                    "max_files_read": max_files_read,
+                    "restrict_file_tools_to_workdir": restrict_file_tools_to_workdir,
+                }.items()
+                if value is not None
+            }
             job = create_job(
                 prompt=prompt or "",
                 schedule=schedule,
@@ -750,6 +798,7 @@ def cronjob(
                 workdir=_normalize_optional_job_value(workdir),
                 no_agent=_no_agent,
                 attach_to_session=attach_to_session,
+                **guardrail_kwargs,
             )
             _notify_provider_jobs_changed_safe()
             _create_message = f"Cron job '{job['name']}' created."
@@ -927,6 +976,22 @@ def cronjob(
                 # Empty string clears the field (restores old behaviour);
                 # otherwise pass raw — update_job() validates / normalizes.
                 updates["workdir"] = _normalize_optional_job_value(workdir) or None
+            for field, value in {
+                "script_fail_closed": script_fail_closed,
+                "max_iterations": max_iterations,
+                "max_tokens": max_tokens,
+                "reasoning_effort": reasoning_effort,
+                "max_duration_seconds": max_duration_seconds,
+                "max_tool_output_bytes": max_tool_output_bytes,
+                "max_total_tool_output_bytes": max_total_tool_output_bytes,
+                "skip_context_files": skip_context_files,
+                "terminal_sandbox": terminal_sandbox,
+                "max_tool_calls": max_tool_calls,
+                "max_files_read": max_files_read,
+                "restrict_file_tools_to_workdir": restrict_file_tools_to_workdir,
+            }.items():
+                if value is not None:
+                    updates[field] = value
             if no_agent is not None:
                 # Toggling no_agent on/off at update time. If flipping to True,
                 # we need a script to already exist on the job (or be part of
@@ -1081,6 +1146,70 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
                 "type": "string",
                 "description": "Optional absolute path to run the job from. When set, AGENTS.md / CLAUDE.md / .cursorrules from that directory are injected into the system prompt, and the terminal/file/code_exec tools use it as their working directory — useful for running a job inside a specific project repo. Must be an absolute path that exists. When unset (default), preserves the original behaviour: no project context files, tools use the scheduler's cwd. On update, pass an empty string to clear. Jobs with workdir run sequentially (not parallel) to keep per-job directories isolated."
             },
+            "script_fail_closed": {
+                "type": "boolean",
+                "description": "When True, a failed pre-run script aborts the tick before constructing an AI agent. Omit to preserve legacy fail-open behavior."
+            },
+            "max_iterations": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Optional positive per-job cap on agent tool-calling iterations."
+            },
+            "max_tokens": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Optional positive per-job cap on model output tokens."
+            },
+            "reasoning_effort": {
+                "oneOf": [
+                    {"type": "boolean", "enum": [False]},
+                    {
+                        "type": "string",
+                        "enum": [
+                            "none", "false", "disabled", "minimal", "low",
+                            "medium", "high", "xhigh", "max", "ultra"
+                        ],
+                    },
+                ],
+                "description": "Optional per-job reasoning effort. Set false (or a disabled string) to disable reasoning; otherwise use a supported effort level."
+            },
+            "max_duration_seconds": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Optional positive wall-clock limit for the agent run, independent of the inactivity timeout."
+            },
+            "max_tool_output_bytes": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Optional positive UTF-8 byte cap applied to each textual tool result."
+            },
+            "max_total_tool_output_bytes": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Optional positive cumulative UTF-8 byte cap across textual tool results in this agent run."
+            },
+            "skip_context_files": {
+                "type": "boolean",
+                "description": "Explicitly enable or disable project context-file discovery for this job."
+            },
+            "terminal_sandbox": {
+                "type": "boolean",
+                "description": "Run terminal and file-tool shell operations in a Linux unshare sandbox. True requires workdir."
+            },
+            "max_tool_calls": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Optional positive hard cap on total tool calls across the job run, including parallel batches."
+            },
+            "max_files_read": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Optional positive cap on unique files exposed through model-visible file reads and searches."
+            },
+            "restrict_file_tools_to_workdir": {
+                "type": "boolean",
+                "description": "When True, read/search/write/patch paths must remain under workdir after resolving traversal and symlinks. True requires workdir."
+            },
             "attach_to_session": {
                 "type": "boolean",
                 "description": "When True, this job becomes CONTINUABLE: the user can reply to its delivery and the agent has the brief in context instead of asking 'what is that?'. On thread-capable platforms (Telegram topics, Discord/Slack threads) a dedicated thread is opened for the job and its replies; on DM-only platforms (WhatsApp/Signal) the brief is mirrored into the origin DM session. Use this for conversational recurring jobs the user will reply to — daily briefings, reminders that kick off follow-up work. Leave unset for fire-and-forget alerts/watchdogs. Overrides the global cron.mirror_delivery config for this one job. Only the origin chat is touched (never fan-out targets); no effect when deliver='local'."
@@ -1140,6 +1269,18 @@ registry.register(
         enabled_toolsets=args.get("enabled_toolsets"),
         workdir=args.get("workdir"),
         no_agent=args.get("no_agent"),
+        script_fail_closed=args.get("script_fail_closed"),
+        max_iterations=args.get("max_iterations"),
+        max_tokens=args.get("max_tokens"),
+        reasoning_effort=args.get("reasoning_effort"),
+        max_duration_seconds=args.get("max_duration_seconds"),
+        max_tool_output_bytes=args.get("max_tool_output_bytes"),
+        max_total_tool_output_bytes=args.get("max_total_tool_output_bytes"),
+        skip_context_files=args.get("skip_context_files"),
+        terminal_sandbox=args.get("terminal_sandbox"),
+        max_tool_calls=args.get("max_tool_calls"),
+        max_files_read=args.get("max_files_read"),
+        restrict_file_tools_to_workdir=args.get("restrict_file_tools_to_workdir"),
         task_id=kw.get("task_id"),
     ))(),
     check_fn=check_cronjob_requirements,

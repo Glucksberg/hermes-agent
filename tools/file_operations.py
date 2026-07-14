@@ -29,6 +29,8 @@ import os
 import re
 import difflib
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any, ClassVar
 from pathlib import Path
@@ -39,6 +41,31 @@ from agent.file_safety import (
     build_write_denied_prefixes,
     is_write_denied as _shared_is_write_denied,
 )
+
+
+_EXTERNAL_DIAGNOSTICS_ALLOWED: ContextVar[bool] = ContextVar(
+    "file_external_diagnostics_allowed",
+    default=True,
+)
+
+
+@contextmanager
+def restricted_cron_file_diagnostics():
+    """Disable subprocess and LSP diagnostics for one restricted cron call.
+
+    Context-local state keeps concurrent interactive/non-cron writes on the
+    legacy diagnostics path even when their ``ShellFileOperations`` instance
+    is shared with a cron task.
+    """
+    token = _EXTERNAL_DIAGNOSTICS_ALLOWED.set(False)
+    try:
+        yield
+    finally:
+        _EXTERNAL_DIAGNOSTICS_ALLOWED.reset(token)
+
+
+def _external_diagnostics_allowed() -> bool:
+    return _EXTERNAL_DIAGNOSTICS_ALLOWED.get()
 
 
 # ---------------------------------------------------------------------------
@@ -1440,7 +1467,10 @@ class ShellFileOperations(FileOperations):
         # extensions outside both sets (binaries, opaque formats),
         # skipping the read keeps the hot path fast.
         pre_content: Optional[str] = None
-        want_pre = ext in LINTERS_INPROC or self._lsp_handles_extension(ext)
+        want_pre = ext in LINTERS_INPROC or (
+            _external_diagnostics_allowed()
+            and self._lsp_handles_extension(ext)
+        )
         if want_pre:
             # Best-effort read; failure (file missing, permission) leaves
             # pre_content as None which makes both downstream consumers
@@ -1728,6 +1758,14 @@ class ShellFileOperations(FileOperations):
         if inproc is not None:
             # Need content — either passed in or read from disk.
             if content is None:
+                if not _external_diagnostics_allowed():
+                    return LintResult(
+                        skipped=True,
+                        message=(
+                            "Restricted cron skipped diagnostics that would "
+                            "require a subprocess read"
+                        ),
+                    )
                 read_cmd = f"cat {self._escape_shell_arg(path)} 2>/dev/null"
                 read_result = self._exec(read_cmd)
                 if read_result.exit_code != 0:
@@ -1737,6 +1775,15 @@ class ShellFileOperations(FileOperations):
             if err == "__SKIP__":
                 return LintResult(skipped=True, message=f"No linter available for {ext} (missing dependency)")
             return LintResult(success=ok, output="" if ok else err)
+
+        if not _external_diagnostics_allowed():
+            return LintResult(
+                skipped=True,
+                message=(
+                    "Restricted cron skipped external shell, package-manager, "
+                    "and subprocess diagnostics"
+                ),
+            )
 
         # Fall back to shell linter.
         if ext not in LINTERS:
@@ -1906,7 +1953,7 @@ class ShellFileOperations(FileOperations):
         in-process metadata; we still gate the actual LSP path on
         :meth:`_lsp_local_only`.
         """
-        if not ext:
+        if not ext or not _external_diagnostics_allowed():
             return False
         try:
             from agent.lsp.servers import SERVERS
@@ -1935,7 +1982,7 @@ class ShellFileOperations(FileOperations):
         runs as before — never suppress lint based on an LSP probe that
         couldn't actually answer the question.
         """
-        if not self._lsp_local_only():
+        if not _external_diagnostics_allowed() or not self._lsp_local_only():
             return False
         try:
             from agent.lsp import get_service
@@ -1961,7 +2008,7 @@ class ShellFileOperations(FileOperations):
         Skipped entirely on non-local backends (Docker, Modal, SSH,
         etc.) — the server can't see files inside the sandbox.
         """
-        if not self._lsp_local_only():
+        if not _external_diagnostics_allowed() or not self._lsp_local_only():
             return
         try:
             from agent.lsp import get_service
@@ -2002,7 +2049,7 @@ class ShellFileOperations(FileOperations):
         Skipped entirely on non-local backends (Docker, Modal, SSH,
         etc.) — same reasoning as ``_snapshot_lsp_baseline``.
         """
-        if not self._lsp_local_only():
+        if not _external_diagnostics_allowed() or not self._lsp_local_only():
             return ""
         try:
             from agent.lsp import get_service

@@ -3681,9 +3681,45 @@ class APIServerAdapter(BasePlatformAdapter):
 
     _JOB_ID_RE = __import__("re").compile(r"[a-f0-9]{12}")
     # Allowed fields for update — prevents clients injecting arbitrary keys
-    _UPDATE_ALLOWED_FIELDS = {"name", "schedule", "prompt", "deliver", "skills", "skill", "repeat", "enabled"}
+    _CRON_GUARDRAIL_FIELDS = {
+        "script_fail_closed",
+        "max_iterations",
+        "max_tokens",
+        "reasoning_effort",
+        "max_duration_seconds",
+        "max_tool_output_bytes",
+        "max_total_tool_output_bytes",
+        "skip_context_files",
+        "terminal_sandbox",
+        "max_tool_calls",
+        "max_files_read",
+        "restrict_file_tools_to_workdir",
+    }
+    _UPDATE_ALLOWED_FIELDS = {
+        "name", "schedule", "prompt", "deliver", "skills", "skill",
+        "repeat", "enabled", "workdir", "enabled_toolsets",
+    } | _CRON_GUARDRAIL_FIELDS
     _MAX_NAME_LENGTH = 200
     _MAX_PROMPT_LENGTH = 5000
+
+    @staticmethod
+    def _normalize_cron_enabled_toolsets(value) -> list[str] | None:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            raw_items = value.split(",")
+        elif isinstance(value, list):
+            raw_items = value
+        else:
+            raise ValueError("enabled_toolsets must be an array of names")
+        normalized = []
+        for item in raw_items:
+            if not isinstance(item, str):
+                raise ValueError("enabled_toolsets entries must be strings")
+            name = item.strip()
+            if name and name not in normalized:
+                normalized.append(name)
+        return normalized or None
 
     @staticmethod
     def _check_jobs_available() -> Optional["web.Response"]:
@@ -3770,10 +3806,21 @@ class APIServerAdapter(BasePlatformAdapter):
                 kwargs["skills"] = skills
             if repeat is not None:
                 kwargs["repeat"] = repeat
+            if "workdir" in body:
+                kwargs["workdir"] = body["workdir"]
+            if "enabled_toolsets" in body:
+                kwargs["enabled_toolsets"] = self._normalize_cron_enabled_toolsets(
+                    body["enabled_toolsets"]
+                )
+            for field in self._CRON_GUARDRAIL_FIELDS:
+                if field in body:
+                    kwargs[field] = body[field]
 
             job = _cron_create(**kwargs)
             _notify_cron_provider_jobs_changed()
             return web.json_response({"job": job})
+        except ValueError as e:
+            return web.json_response({"error": _redact_api_error_text(e)}, status=400)
         except Exception as e:
             return web.json_response({"error": _redact_api_error_text(e)}, status=500)
 
@@ -3826,11 +3873,17 @@ class APIServerAdapter(BasePlatformAdapter):
                 scan_error = _scan_cron_prompt(sanitized["prompt"])
                 if scan_error:
                     return web.json_response({"error": scan_error}, status=400)
+            if "enabled_toolsets" in sanitized:
+                sanitized["enabled_toolsets"] = self._normalize_cron_enabled_toolsets(
+                    sanitized["enabled_toolsets"]
+                )
             job = _cron_update(job_id, sanitized)
             if not job:
                 return web.json_response({"error": "Job not found"}, status=404)
             _notify_cron_provider_jobs_changed()
             return web.json_response({"job": job})
+        except ValueError as e:
+            return web.json_response({"error": _redact_api_error_text(e)}, status=400)
         except Exception as e:
             return web.json_response({"error": _redact_api_error_text(e)}, status=500)
 

@@ -1,6 +1,8 @@
 """Tests for tools/cronjob_tools.py — prompt scanning, schedule/list/remove dispatchers."""
 
 import json
+from unittest.mock import patch
+
 import pytest
 
 from tools.cronjob_tools import (
@@ -263,6 +265,22 @@ class TestUnifiedCronjobTool:
         assert listing["count"] == 1
         assert listing["jobs"][0]["name"] == "Server Check"
         assert listing["jobs"][0]["state"] == "scheduled"
+
+    def test_registry_forwards_inference_caps(self):
+        from tools.registry import registry
+
+        with patch("tools.cronjob_tools.cronjob", return_value='{"success": true}') as invoke:
+            result = json.loads(registry.dispatch("cronjob", {
+                "action": "create",
+                "prompt": "Check",
+                "schedule": "every 1h",
+                "max_tokens": 640,
+                "reasoning_effort": False,
+            }))
+
+        assert result["success"] is True
+        assert invoke.call_args.kwargs["max_tokens"] == 640
+        assert invoke.call_args.kwargs["reasoning_effort"] is False
 
     def test_list_handles_partial_legacy_job_records(self):
         from cron.jobs import save_jobs

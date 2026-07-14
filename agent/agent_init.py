@@ -346,6 +346,13 @@ def init_agent(
     checkpoint_max_total_size_mb: int = 500,
     checkpoint_max_file_size_mb: int = 10,
     pass_session_id: bool = False,
+    max_tool_output_bytes: Optional[int] = None,
+    max_total_tool_output_bytes: Optional[int] = None,
+    max_tool_calls: Optional[int] = None,
+    max_files_read: Optional[int] = None,
+    restrict_file_tools_to_workdir: bool = False,
+    file_tool_workdir: Optional[str] = None,
+    cron_hard_max_tokens: Optional[int] = None,
 ):
     """
     Initialize the AI Agent.
@@ -400,8 +407,23 @@ def init_agent(
 
     agent.model = model
     agent.max_iterations = max_iterations
-    # Shared iteration budget — parent creates, children inherit.
-    # Consumed by every LLM turn across parent + all subagents.
+    agent.max_tool_output_bytes = max_tool_output_bytes
+    agent.max_total_tool_output_bytes = max_total_tool_output_bytes
+    agent.max_tool_calls = max_tool_calls
+    agent.max_files_read = max_files_read
+    agent.restrict_file_tools_to_workdir = restrict_file_tools_to_workdir
+    agent.file_tool_workdir = file_tool_workdir
+    agent._cron_hard_max_tokens = (
+        cron_hard_max_tokens
+        if type(cron_hard_max_tokens) is int and cron_hard_max_tokens > 0
+        else None
+    )
+    agent._tool_output_bytes_used = 0
+    agent._tool_calls_used = 0
+    agent._files_read = set()
+    agent._cron_guardrail_lock = threading.Lock()
+    # A caller-supplied budget can be shared across an agent tree. Ordinary
+    # agents create their own; guarded cron delegation passes the root budget.
     agent.iteration_budget = iteration_budget or IterationBudget(max_iterations)
     agent.tool_delay = tool_delay
     agent.save_trajectories = save_trajectories
