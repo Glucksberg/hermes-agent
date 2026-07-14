@@ -1202,6 +1202,13 @@ DEFAULT_CONFIG = {
         # failure isn't silent from the UI's perspective.  Set false to suppress.
         "turn_completion_explainer": True,
         "show_cost": False,       # Show $ cost in the status bar (off by default)
+        # Classic CLI: asynchronously show llama.cpp model residency for local
+        # routes. The timeout is only an estimated countdown; /props remains
+        # authoritative for loaded vs sleeping state.
+        "local_model_status": {
+            "enabled": True,
+            "idle_timeout_seconds": None,
+        },
         # Show a color-coded battery read-out as the first status-bar element in
         # the CLI/TUI (off by default). No-op on machines without a battery.
         "battery": False,

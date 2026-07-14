@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 
 import cli as cli_mod
 from cli import HermesCLI
+from hermes_cli.local_model_status import LocalModelDisplay, LocalModelProbeResult, LocalModelState
 
 
 def _make_cli(model: str = "anthropic/claude-sonnet-4-20250514"):
@@ -74,6 +75,89 @@ class TestCLIStatusBar:
 
         assert snapshot["session_title"] == "user-profiles"
 
+    def test_local_model_display_observes_only_the_active_local_route(self):
+        cli_obj = _make_cli("local.gguf")
+        cli_obj.provider = "custom"
+        cli_obj.base_url = "http://127.0.0.1:8080/v1"
+        cli_obj.api_key = "test-secret"
+        cli_obj.agent = SimpleNamespace(
+            provider="custom",
+            base_url="http://127.0.0.1:8080/v1",
+            model="local.gguf",
+            api_key="test-secret",
+            client=SimpleNamespace(base_url="http://127.0.0.1:8080/v1"),
+            _client_kwargs={
+                "api_key": "test-secret",
+                "base_url": "http://127.0.0.1:8080/v1",
+                "default_headers": {"X-Local-Proxy": "header-secret"},
+                "ssl_ca_cert": "/tmp/test-ca.pem",
+                "ssl_verify": False,
+            },
+        )
+        cli_obj._local_model_idle_timeout_seconds = 300
+        cli_obj._last_local_model_activity_at = 100.0
+        cli_obj._last_local_model_activity_route = (
+            "custom",
+            "http://127.0.0.1:8080/v1",
+            "local.gguf",
+        )
+        cli_obj._turn_live = False
+        cli_obj._local_model_status_monitor = MagicMock()
+        cli_obj._local_model_status_monitor.observe.return_value = LocalModelProbeResult(
+            state=LocalModelState.LOADED,
+            supported=True,
+            checked_at=116.0,
+        )
+
+        with patch.object(cli_mod.time, "monotonic", return_value=117.0):
+            display = cli_obj._get_local_model_status_display()
+
+        route = cli_obj._local_model_status_monitor.observe.call_args.args[0]
+        assert route.key == cli_obj._last_local_model_activity_route
+        assert "test-secret" not in repr(route)
+        assert "header-secret" not in repr(route)
+        assert dict(route.extra_headers) == {"X-Local-Proxy": "header-secret"}
+        assert route.ssl_ca_cert == "/tmp/test-ca.pem"
+        assert route.ssl_verify is False
+        assert display.label == "~4m43s"
+
+        cli_obj.agent.base_url = "https://api.example.com/v1"
+        assert cli_obj._get_local_model_status_display() is None
+        cli_obj._local_model_status_monitor.observe.assert_called_with(None)
+
+    def test_local_route_never_falls_back_to_cli_or_mixed_agent_credentials(self):
+        cli_obj = _make_cli("local.gguf")
+        cli_obj.provider = "custom"
+        cli_obj.base_url = "http://127.0.0.1:8080/v1"
+        cli_obj.api_key = "unrelated-cloud-secret"
+
+        assert cli_obj._get_active_local_model_route() is None
+
+        cli_obj.agent = SimpleNamespace(
+            provider="custom",
+            base_url="http://127.0.0.1:8080/v1",
+            model="local.gguf",
+            api_key="",
+            client=SimpleNamespace(base_url="http://127.0.0.1:8080/v1"),
+            _client_kwargs={
+                "api_key": "",
+                "base_url": "http://127.0.0.1:8080/v1",
+            },
+        )
+        route = cli_obj._get_active_local_model_route()
+        assert route is not None
+        assert route.api_key == ""
+
+        cli_obj.agent.client = SimpleNamespace(base_url="https://remote.example/v1")
+        assert cli_obj._get_active_local_model_route() is None
+
+        cli_obj.agent.base_url = "http://LOCALHOST:80/v1"
+        cli_obj.agent._client_kwargs["base_url"] = "http://LOCALHOST:80/v1"
+        cli_obj.agent.client = SimpleNamespace(base_url="http://localhost/v1/")
+        route = cli_obj._get_active_local_model_route()
+        assert route is not None
+        assert route.base_url == "http://127.0.0.1/v1"
+
     def test_context_style_thresholds(self):
         cli_obj = _make_cli()
 
@@ -102,6 +186,116 @@ class TestCLIStatusBar:
         assert "$0.06" not in text  # cost hidden by default
         assert "15m" in text
 
+    def test_local_model_residency_follows_idle_time_and_precedes_yolo(self):
+        cli_obj = _attach_agent(
+            _make_cli("local.gguf"),
+            prompt_tokens=10_230,
+            completion_tokens=2_220,
+            total_tokens=12_450,
+            api_calls=7,
+            context_tokens=12_450,
+            context_length=200_000,
+        )
+        cli_obj._status_bar_visible = True
+        cli_obj._last_turn_finished_at = time.time() - 17
+        snapshot = cli_obj._get_status_bar_snapshot()
+        snapshot["local_model_status"] = LocalModelDisplay(
+            bar="[██████████]",
+            label="~4m43s",
+            style="loaded",
+        )
+
+        with patch.object(cli_obj, "_get_status_bar_snapshot", return_value=snapshot), \
+             patch.object(cli_obj, "_get_tui_terminal_width", return_value=200), \
+             patch.object(cli_obj, "_is_session_yolo_active", return_value=True):
+            fragments = cli_obj._get_status_bar_fragments()
+
+        plain = "".join(text for _style, text in fragments)
+        assert plain.index("✓ 17s") < plain.index("[██████████]") < plain.index("⚠ YOLO")
+        assert ("class:status-bar-local-loaded", "[██████████]") in fragments
+        assert ("class:status-bar-local-label", " ~4m43s") in fragments
+
+        with patch.object(cli_obj, "_get_status_bar_snapshot", return_value=snapshot), \
+             patch.object(cli_obj, "_get_tui_terminal_width", return_value=200), \
+             patch.object(cli_obj, "_is_session_yolo_active", return_value=True):
+            text = cli_obj._build_status_bar_text(width=200)
+
+        assert "✓ 17s │ [██████████] ~4m43s │ ⚠ YOLO" in text
+
+        full_width = sum(cli_obj._status_bar_display_width(value) for _style, value in fragments)
+        constrained_width = full_width - 5
+        with patch.object(cli_obj, "_get_status_bar_snapshot", return_value=snapshot), \
+             patch.object(cli_obj, "_get_tui_terminal_width", return_value=constrained_width), \
+             patch.object(cli_obj, "_is_session_yolo_active", return_value=True):
+            constrained = cli_obj._get_status_bar_fragments()
+
+        constrained_plain = "".join(value for _style, value in constrained)
+        assert "[██████████]" not in constrained_plain
+        assert "~4m43s" not in constrained_plain
+        assert "⚠ YOLO" in constrained_plain
+
+    def test_local_model_fragment_removal_keeps_prepended_battery(self):
+        """Width fallback removes the local widget, not battery fragments."""
+        cli_obj = _attach_agent(
+            _make_cli("local.gguf"),
+            prompt_tokens=10_230,
+            completion_tokens=2_220,
+            total_tokens=12_450,
+            api_calls=7,
+            context_tokens=12_450,
+            context_length=200_000,
+        )
+        cli_obj._status_bar_visible = True
+        snapshot = cli_obj._get_status_bar_snapshot()
+        snapshot["battery_label"] = "BAT 50%"
+        snapshot["battery_category"] = "good"
+        snapshot["local_model_status"] = LocalModelDisplay(
+            bar="[██████████]",
+            label="~4m43s",
+            style="loaded",
+        )
+
+        with patch.object(cli_obj, "_get_status_bar_snapshot", return_value=snapshot), \
+             patch.object(cli_obj, "_get_tui_terminal_width", return_value=200), \
+             patch.object(cli_obj, "_is_session_yolo_active", return_value=True):
+            wide = cli_obj._get_status_bar_fragments()
+
+        constrained_width = sum(
+            cli_obj._status_bar_display_width(value) for _style, value in wide
+        ) - 5
+        with patch.object(cli_obj, "_get_status_bar_snapshot", return_value=snapshot), \
+             patch.object(cli_obj, "_get_tui_terminal_width", return_value=constrained_width), \
+             patch.object(cli_obj, "_is_session_yolo_active", return_value=True):
+            constrained = cli_obj._get_status_bar_fragments()
+
+        constrained_plain = "".join(value for _style, value in constrained)
+        assert "BAT 50%" in constrained_plain
+        assert "[██████████]" not in constrained_plain
+        assert "~4m43s" not in constrained_plain
+        assert "⚠ YOLO" in constrained_plain
+
+    def test_post_compression_sentinel_does_not_render_negative(self):
+        """Right after a compression, last_prompt_tokens is parked at the -1
+        sentinel until the next API call reports real usage. The status bar
+        must clamp it to 0 instead of rendering "-1/200K" / "-1%".
+        """
+        cli_obj = _attach_agent(
+            _make_cli(),
+            prompt_tokens=10_230,
+            completion_tokens=2_220,
+            total_tokens=12_450,
+            api_calls=7,
+            context_tokens=-1,
+            context_length=200_000,
+        )
+
+        snapshot = cli_obj._get_status_bar_snapshot()
+        assert snapshot["context_tokens"] == 0
+        assert snapshot["context_percent"] == 0
+
+        text = cli_obj._build_status_bar_text(width=120)
+        assert "-1" not in text
+        assert "0/200K" in text
 
     def test_input_height_counts_prompt_only_on_first_wrapped_row(self):
         # Regression for prompt_toolkit classic CLI resize glitches: the prompt
@@ -350,5 +544,3 @@ class TestIdleSinceLastTurn:
         cli_obj._prompt_duration = 5.0
         snapshot = cli_obj._get_status_bar_snapshot()
         assert snapshot["idle_since"].startswith("✓ ")
-
-
