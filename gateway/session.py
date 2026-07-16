@@ -3768,10 +3768,10 @@ class SessionStore:
         except Exception:
             pass
         try:
-            # Heal alternation at the live replay boundary while retaining
-            # observed messages as hard boundaries: merging adjacent observed
-            # users would discard platform message ids used by audio-reference
-            # selection.
+            # This load feeds LIVE REPLAY. Heal durable alternation violations
+            # at the restore boundary, but keep observed rows as boundaries:
+            # merging consecutive observed users discards all but the first
+            # platform message id and breaks later audio-reference selection.
             messages = self._db.get_messages_as_conversation(session_id)
             if messages:
                 from agent.agent_runtime_helpers import repair_message_sequence
