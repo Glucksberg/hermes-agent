@@ -79,6 +79,7 @@ from hermes_cli.fallback_config import get_fallback_chain
 # (see gateway/agent_cache_pressure.py).
 _AGENT_CACHE_MAX_SIZE = 128
 _AGENT_CACHE_IDLE_TTL_SECS = 3600.0  # evict agents idle for >1h
+_OBSERVED_AUDIO_TRANSCRIPT_CACHE_MAX_SIZE = 128
 _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 # Telegram cold polling now proves one real getUpdates round trip before connect
 # returns. Leave enough outer budget for initialize/deleteWebhook/start_polling
@@ -22736,7 +22737,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         transcript_cache = getattr(self, "_observed_audio_transcript_cache", None)
         if transcript_cache is None:
-            transcript_cache = {}
+            transcript_cache = OrderedDict()
             self._observed_audio_transcript_cache = transcript_cache
 
         context_start = _observed_context_start_index(history)
@@ -22763,6 +22764,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except OSError:
                 return history
 
+            # A path can be reused after the underlying cache file changes.
+            # Drop obsolete stat-key versions so stale private transcripts do
+            # not remain process-long, even though they can no longer be hit.
+            for old_key in list(transcript_cache):
+                if old_key[0] == resolved and old_key != cache_key:
+                    transcript_cache.pop(old_key, None)
+
             transcript = transcript_cache.get(cache_key)
             if transcript is None:
                 try:
@@ -22786,6 +22794,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if not transcript:
                     return history
                 transcript_cache[cache_key] = transcript
+                transcript_cache.move_to_end(cache_key)
+                while len(transcript_cache) > _OBSERVED_AUDIO_TRANSCRIPT_CACHE_MAX_SIZE:
+                    transcript_cache.popitem(last=False)
+            else:
+                transcript_cache.move_to_end(cache_key)
 
             updated = dict(msg)
             updated["content"] = _append_observed_audio_transcript_note(
