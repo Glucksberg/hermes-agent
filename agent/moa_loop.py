@@ -1358,7 +1358,7 @@ def aggregate_moa_context(
             messages=agg_messages,
             temperature=aggregator_temperature,
             reasoning_config=_aggregator_reasoning_config(aggregator),
-            max_tokens=max_tokens,
+            **({"max_tokens": max_tokens} if max_tokens is not None else {}),
             **agg_runtime,
         )
         synthesis = _extract_text(response)
