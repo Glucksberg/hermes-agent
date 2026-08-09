@@ -18074,26 +18074,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     if _hyg_rotated:
                                         # Reset stored token count — transcript rewritten
                                         session_entry.last_prompt_tokens = 0
+                                        # Measure the compression result itself. The
+                                        # reload may include inherited observed rows that
+                                        # are needed for this turn but are not evidence
+                                        # that compaction failed to make progress.
+                                        _new_count = len(_compressed)
+                                        _new_tokens = estimate_messages_tokens_rough(
+                                            _compressed
+                                        )
                                         # Reload so observed context inherited from
                                         # compression ancestors is visible on this turn.
                                         history = await self.async_session_store.load_transcript(
                                             session_entry.session_id
-                                        )
-                                        _new_count = len(history)
-                                        _new_tokens = estimate_messages_tokens_rough(
-                                            history
                                         )
                                     elif _hyg_in_place:
                                         # archive_and_compact() already persisted the
                                         # compacted transcript inside _compress_context.
                                         # Reset counts to match the new active set.
                                         session_entry.last_prompt_tokens = 0
+                                        _new_count = len(_compressed)
+                                        _new_tokens = estimate_messages_tokens_rough(
+                                            _compressed
+                                        )
                                         history = await self.async_session_store.load_transcript(
                                             session_entry.session_id
-                                        )
-                                        _new_count = len(history)
-                                        _new_tokens = estimate_messages_tokens_rough(
-                                            history
                                         )
                                     else:
                                         # No rewrite happened — transcript preserved
