@@ -79,6 +79,7 @@ class TurnContext:
 
     # --- turn parameters / config snapshots (read-only in run_sync) -------
     history: Any = None
+    observed_audio_transcripts: List[str] = field(default_factory=list)
     context_prompt: Optional[str] = None
     channel_prompt: Optional[str] = None
     session_id: Optional[str] = None
