@@ -98,6 +98,14 @@ from utils import base_url_host_matches, env_var_enabled
 logger = logging.getLogger(__name__)
 
 
+def _cron_capped_output_tokens(agent, value: int) -> int:
+    """Clamp a one-shot retry budget to an explicit per-job cron ceiling."""
+    cap = getattr(agent, "_cron_hard_max_tokens", None)
+    if type(cap) is int and cap > 0:
+        return min(int(value), cap)
+    return int(value)
+
+
 # Scaffold marker used by _apply_active_turn_redirect and the ghost-row filter
 # in the api_messages loop. Module-level so both sites can never drift.
 _INTERRUPT_SCAFFOLD_MARKER = "[This response was interrupted by a user correction.]"
@@ -1969,6 +1977,19 @@ def run_conversation(
                 from agent.message_content import flatten_message_text as _flatten_mt
                 from agent.moa_loop import _preset_temperature, aggregate_moa_context
 
+                _moa_caller_max_tokens = agent.max_tokens
+                _moa_hard_cap = getattr(agent, "_cron_hard_max_tokens", None)
+                if type(_moa_hard_cap) is int and _moa_hard_cap > 0:
+                    if (
+                        type(_moa_caller_max_tokens) is int
+                        and _moa_caller_max_tokens > 0
+                    ):
+                        _moa_caller_max_tokens = min(
+                            _moa_caller_max_tokens, _moa_hard_cap
+                        )
+                    else:
+                        _moa_caller_max_tokens = _moa_hard_cap
+
                 _moa_context = aggregate_moa_context(
                     user_prompt=(
                         original_user_message
@@ -1985,6 +2006,7 @@ def run_conversation(
                     temperature=_preset_temperature(moa_config, "reference_temperature"),
                     aggregator_temperature=_preset_temperature(moa_config, "aggregator_temperature"),
                     reference_max_tokens=moa_config.get("reference_max_tokens"),
+                    max_tokens=_moa_caller_max_tokens,
                     # None = no per-preset override; inherit
                     # auxiliary.moa_reference.timeout via call_llm.
                     reference_timeout=(
@@ -2677,6 +2699,11 @@ def run_conversation(
                         _use_streaming = False
 
                 def _perform_api_call(next_api_kwargs):
+                    from agent.chat_completion_helpers import clamp_cron_hard_token_cap
+
+                    next_api_kwargs = clamp_cron_hard_token_cap(
+                        agent, next_api_kwargs
+                    )
                     if agent.api_mode == "codex_responses":
                         next_api_kwargs = agent._get_transport().preflight_kwargs(
                             next_api_kwargs,
@@ -3488,7 +3515,9 @@ def run_conversation(
                                 if _tc_requested_cap is not None:
                                     _tc_boost = max(_tc_boost, _tc_requested_cap)
                                 _tc_boost_cap = max(32768, _tc_requested_cap or 0)
-                                agent._ephemeral_max_output_tokens = min(_tc_boost, _tc_boost_cap)
+                                agent._ephemeral_max_output_tokens = _cron_capped_output_tokens(
+                                    agent, min(_tc_boost, _tc_boost_cap)
+                                )
                                 # Don't append the broken response to messages;
                                 # just re-run the same API call from the current
                                 # message state, giving the model another chance.
@@ -5132,7 +5161,9 @@ def run_conversation(
                             # budget, which is authoritative for the failed
                             # request.
                             safe_out = max(1, available_out - 64)
-                        agent._ephemeral_max_output_tokens = safe_out
+                        agent._ephemeral_max_output_tokens = _cron_capped_output_tokens(
+                            agent, safe_out
+                        )
                         agent._buffer_vprint(
                             f"⚠️  Output cap too large for current prompt — "
                             f"retrying with max_tokens={safe_out:,} "
@@ -6058,7 +6089,9 @@ def run_conversation(
             if _requested_cap is not None:
                 _boost = max(_boost, _requested_cap)
             _boost_cap = max(32768, _requested_cap or 0)
-            agent._ephemeral_max_output_tokens = min(_boost, _boost_cap)
+            agent._ephemeral_max_output_tokens = _cron_capped_output_tokens(
+                agent, min(_boost, _boost_cap)
+            )
             continue
 
         # Guard: if all retries exhausted without a successful response

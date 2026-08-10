@@ -1175,6 +1175,21 @@ def _preset_temperature(preset: dict[str, Any], key: str) -> float | None:
         return None
 
 
+def _bounded_moa_tokens(requested: Any, caller_max_tokens: Any) -> int | None:
+    """Clamp an optional MoA slot budget to the caller's output ceiling."""
+    requested_cap = requested if type(requested) is int and requested > 0 else None
+    caller_cap = (
+        caller_max_tokens
+        if type(caller_max_tokens) is int and caller_max_tokens > 0
+        else None
+    )
+    if caller_cap is None:
+        return requested_cap
+    if requested_cap is None:
+        return caller_cap
+    return min(requested_cap, caller_cap)
+
+
 def _is_failed_reference(text: str) -> bool:
     """Return whether a reference output is an internal failure/skip sentinel.
 
@@ -1215,6 +1230,7 @@ def aggregate_moa_context(
     temperature: float | None = None,
     aggregator_temperature: float | None = None,
     reference_max_tokens: int | None = None,
+    max_tokens: int | None = None,
     reference_timeout: float | None = None,
     degraded_reference_policy: str = "loud",
     agent: Any = None,
@@ -1244,11 +1260,12 @@ def aggregate_moa_context(
     reference_models = [slot for slot in reference_models if slot.get("enabled", True)]
     reference_outputs: list[tuple[str, str, Any]] = []
     ref_messages = _reference_messages(api_messages)
+    bounded_reference_tokens = _bounded_moa_tokens(reference_max_tokens, max_tokens)
     reference_outputs = _run_references_parallel(
         reference_models,
         ref_messages,
         temperature=temperature,
-        max_tokens=reference_max_tokens,
+        max_tokens=bounded_reference_tokens,
         reference_timeout=reference_timeout,
         agent=agent,
     )
@@ -1341,6 +1358,7 @@ def aggregate_moa_context(
             messages=agg_messages,
             temperature=aggregator_temperature,
             reasoning_config=_aggregator_reasoning_config(aggregator),
+            **({"max_tokens": max_tokens} if max_tokens is not None else {}),
             **agg_runtime,
         )
         synthesis = _extract_text(response)
@@ -1915,6 +1933,10 @@ class MoAChatCompletions:
         # The acting aggregator is never capped here (its output is the
         # user-visible answer).
         reference_max_tokens = preset.get("reference_max_tokens")
+        caller_max_tokens = api_kwargs.get("max_tokens")
+        reference_max_tokens = _bounded_moa_tokens(
+            reference_max_tokens, caller_max_tokens
+        )
         # None (the default) = don't send temperature; provider default
         # applies, matching single-model agent behavior. Presets may pin
         # explicit values. See _preset_temperature.
