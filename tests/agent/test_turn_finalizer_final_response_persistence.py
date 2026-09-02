@@ -2,6 +2,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from agent.turn_finalizer import finalize_turn
+from agent.message_sanitization import guard_degenerate_final_response
 
 
 class FakeAgent:
@@ -79,6 +80,72 @@ class FakeAgent:
 
     def _sync_external_memory_for_turn(self, **_kwargs):
         pass
+
+
+def test_degenerate_output_guard_blocks_extreme_phrase_loop():
+    broken = ("I am going to stop. " * 2_000).strip()
+
+    guarded, blocked = guard_degenerate_final_response(broken)
+
+    assert blocked is True
+    assert len(guarded) < 200
+    assert "blocked" in guarded
+
+
+def test_degenerate_output_guard_allows_long_non_repetitive_report():
+    report = "\n".join(
+        f"Record {idx}: product-{idx} crop-{idx % 17} evidence-{idx * 7919}."
+        for idx in range(2_000)
+    )
+
+    guarded, blocked = guard_degenerate_final_response(report)
+
+    assert len(report) >= 20_000
+    assert blocked is False
+    assert guarded == report
+
+
+def test_degenerate_output_guard_ignores_short_repetition():
+    response = "Retry this step. " * 50
+
+    guarded, blocked = guard_degenerate_final_response(response)
+
+    assert blocked is False
+    assert guarded == response
+
+
+def test_finalizer_replaces_degenerate_tail_before_persistence(monkeypatch):
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = FakeAgent()
+    broken = ("I am going to stop. " * 2_000).strip()
+    messages = [
+        {"role": "user", "content": "complete the task"},
+        {"role": "assistant", "content": broken, "_db_persisted": True},
+    ]
+
+    result = finalize_turn(
+        agent,
+        final_response=broken,
+        api_call_count=1,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="complete the task",
+        original_user_message="complete the task",
+        _should_review_memory=False,
+        _turn_exit_reason="text_response(stop)",
+    )
+
+    assert result["failed"] is True
+    assert result["completed"] is False
+    assert result["turn_exit_reason"] == "degenerate_output_blocked"
+    assert agent.persisted_messages is not None
+    assert result["final_response"] == agent.persisted_messages[-1]["content"]
+    assert len(result["final_response"]) < 200
+    assert "_db_persisted" not in messages[-1]
 
 
 

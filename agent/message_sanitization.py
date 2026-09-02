@@ -18,6 +18,7 @@ import hashlib
 import json
 import logging
 import re
+from collections import Counter
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -27,6 +28,60 @@ logger = logging.getLogger(__name__)
 # below as well as by run_agent and the CLI for paste-from-clipboard
 # scrubbing.
 _SURROGATE_RE = re.compile(r'[\ud800-\udfff]')
+
+_DEGENERATE_OUTPUT_MIN_CHARS = 20_000
+_DEGENERATE_OUTPUT_NOTICE = (
+    "The model produced an abnormally long, highly repetitive response, so "
+    "Hermes blocked it before delivery. Please retry in a new session."
+)
+
+
+def guard_degenerate_final_response(text: str) -> tuple[str, bool]:
+    """Replace only extreme, mechanically repetitive model output.
+
+    Long answers remain valid. The guard requires at least 20k characters and
+    then looks for either dominant four-word phrase repetition, dominant
+    repeated sentence/line fragments, or a single-token collapse combined
+    with very low vocabulary diversity. These conditions target provider
+    degeneration without treating ordinary verbose prose, source code, or
+    structured reports as invalid merely because they are long.
+    """
+    if not isinstance(text, str) or len(text) < _DEGENERATE_OUTPUT_MIN_CHARS:
+        return text, False
+
+    normalized = re.sub(r"\s+", " ", text).strip().casefold()
+    tokens = re.findall(r"[^\W_]+(?:['’][^\W_]+)?", normalized, re.UNICODE)
+    if len(tokens) < 1_000:
+        return text, False
+
+    token_counts = Counter(tokens)
+    top_token_count = token_counts.most_common(1)[0][1]
+    token_share = top_token_count / len(tokens)
+    vocabulary_ratio = len(token_counts) / len(tokens)
+
+    four_grams = Counter(zip(tokens, tokens[1:], tokens[2:], tokens[3:]))
+    top_four_gram_count = four_grams.most_common(1)[0][1] if four_grams else 0
+    four_gram_coverage = (top_four_gram_count * 4) / len(tokens)
+
+    fragments = [
+        fragment.strip()
+        for fragment in re.split(r"[\n.!?]+", normalized)
+        if len(fragment.strip()) >= 8
+    ]
+    fragment_counts = Counter(fragments)
+    top_fragment_count = (
+        fragment_counts.most_common(1)[0][1] if fragment_counts else 0
+    )
+    fragment_share = top_fragment_count / max(1, len(fragments))
+
+    degenerate = (
+        (top_four_gram_count >= 25 and four_gram_coverage >= 0.20)
+        or (top_fragment_count >= 25 and fragment_share >= 0.25)
+        or (token_share >= 0.30 and vocabulary_ratio <= 0.08)
+    )
+    if not degenerate:
+        return text, False
+    return _DEGENERATE_OUTPUT_NOTICE, True
 
 
 def _sanitize_surrogates(text: str) -> str:

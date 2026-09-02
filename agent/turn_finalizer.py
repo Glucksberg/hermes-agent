@@ -29,7 +29,10 @@ from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.context_compressor import _DB_PERSISTED_MARKER
 from agent.message_content import flatten_message_text
 from agent.message_metadata import append_message, stamp_message_timestamp
-from agent.message_sanitization import _sanitize_surrogates
+from agent.message_sanitization import (
+    _sanitize_surrogates,
+    guard_degenerate_final_response,
+)
 
 
 def _assistant_row_missing_visible_text(msg: dict) -> bool:
@@ -230,6 +233,40 @@ def finalize_turn(
             _record_kanban_budget_exhausted(
                 _kanban_task, api_call_count, agent.max_iterations, logger,
             )
+
+    # Provider ``finish_reason=stop`` is not proof that the visible answer is
+    # sane. Block only extreme, mechanically repetitive degeneration before
+    # persistence, plugin/memory observation, and gateway delivery.
+    if isinstance(final_response, str) and not interrupted:
+        _original_final_response = final_response
+        final_response, _degenerate_output_blocked = (
+            guard_degenerate_final_response(final_response)
+        )
+        if _degenerate_output_blocked:
+            failed = True
+            _turn_exit_reason = "degenerate_output_blocked"
+            logger.error(
+                "Blocked degenerate final response: session=%s model=%s chars=%d",
+                getattr(agent, "session_id", None),
+                getattr(agent, "model", None),
+                len(_original_final_response),
+            )
+            # The provider response may already be represented by the current
+            # assistant tail. Replace it in place and invalidate the bounded DB
+            # flush cursor so the malformed text cannot enter durable memory.
+            for _candidate in reversed(messages):
+                if not isinstance(_candidate, dict):
+                    continue
+                if _candidate.get("role") == "user":
+                    break
+                if (
+                    _candidate.get("role") == "assistant"
+                    and flatten_message_text(_candidate.get("content"))
+                    == _original_final_response
+                ):
+                    _fill_assistant_tail_content(agent, _candidate, final_response)
+                    break
+            agent._current_streamed_assistant_text = final_response
 
     # Determine if conversation completed successfully
     normal_text_response = str(_turn_exit_reason).startswith("text_response(")

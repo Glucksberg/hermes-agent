@@ -105,6 +105,28 @@ def _run_text_turn(agent, answer: str, *, flush_side_effect=None):
 
 
 class TestCompletedTextTurnIncrementalPersistence:
+    def test_degenerate_text_is_replaced_before_incremental_flush(self, loop_agent):
+        broken = ("I am going to stop. " * 2_000).strip()
+
+        result, events = _run_text_turn(loop_agent, broken)
+
+        assert result["failed"] is True
+        assert result["completed"] is False
+        assert result["turn_exit_reason"] == "degenerate_output_blocked"
+        assert len(result["final_response"]) < 200
+        assert any(
+            kind == "flush"
+            and snapshot
+            and snapshot[-1] == ("assistant", result["final_response"])
+            for kind, snapshot in events
+        )
+        assert not any(
+            kind == "flush"
+            and snapshot
+            and snapshot[-1] == ("assistant", broken)
+            for kind, snapshot in events
+        )
+
     def test_completed_text_turn_is_flushed_before_finalization(self, loop_agent):
         """The assistant row must reach the session DB before the loop exits.
 

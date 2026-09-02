@@ -62,6 +62,7 @@ from agent.message_sanitization import (
     _looks_like_image_content_rejection,
     _strip_images_from_messages,
     _strip_non_ascii,
+    guard_degenerate_final_response,
     serialized_messages_bytes,
 )
 # Must mirror _STALE_TOOL_CALL_MARKER_RE in hermes_state.py — kept local
@@ -8306,6 +8307,42 @@ def run_conversation(
                             _frag.pop("_length_continuation_nudge", None)
                 
                 final_response = agent._strip_think_blocks(final_response).strip()
+
+                # A provider can report finish_reason=stop while emitting a
+                # mechanically repetitive runaway answer. Guard this before
+                # building or incrementally persisting the assistant row; the
+                # finalizer keeps a second backstop for non-standard exits.
+                final_response, _degenerate_output_blocked = (
+                    guard_degenerate_final_response(final_response)
+                )
+                if _degenerate_output_blocked:
+                    failed = True
+                    _turn_exit_reason = "degenerate_output_blocked"
+                    logger.error(
+                        "Blocked degenerate model response before persistence: "
+                        "session=%s model=%s",
+                        getattr(agent, "session_id", None),
+                        getattr(agent, "model", None),
+                    )
+                    final_msg = agent._build_assistant_message(
+                        assistant_message, finish_reason
+                    )
+                    final_msg["content"] = final_response
+                    append_message(messages, final_msg)
+                    try:
+                        agent._flush_messages_to_session_db(
+                            messages, conversation_history
+                        )
+                    except Exception:
+                        logger.warning(
+                            "degenerate-output notice flush failed "
+                            "(session=%s); relying on finalize_turn retry",
+                            getattr(agent, "session_id", None) or "none",
+                            exc_info=True,
+                        )
+                    agent._response_was_previewed = False
+                    agent._current_streamed_assistant_text = final_response
+                    break
                 
                 final_msg = agent._build_assistant_message(assistant_message, finish_reason)
 
