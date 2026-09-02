@@ -38,6 +38,7 @@ _CANONICAL_TABLES = (
     "compression_locks",
     "gateway_routing",
     "async_delegations",
+    "delivery_obligations",
 )
 
 _TOPIC_TABLES = (
@@ -1609,6 +1610,13 @@ def recover_session_database(
                 isolation_level=None,
                 timeout=1.0,
             )
+            # The delivery outbox shares state.db but owns its schema outside
+            # SessionDB. Initialize it explicitly so recovery does not silently
+            # drop final responses that were generated but not yet confirmed
+            # by the messaging platform.
+            from gateway.delivery_ledger import _initialize_schema
+
+            _initialize_schema(destination_conn)
             destination_conn.execute("PRAGMA foreign_keys=OFF")
 
             copy_report: dict[str, dict[str, Any]] = {}

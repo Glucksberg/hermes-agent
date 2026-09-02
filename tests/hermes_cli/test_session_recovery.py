@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import pytest
 
 import hermes_state
+from gateway import delivery_ledger
 from hermes_state import FTS_STORAGE_VERSION, SCHEMA_VERSION, SessionDB
 from hermes_cli import session_recovery
 from hermes_cli.session_recovery import (
@@ -98,6 +99,59 @@ def _make_source(path: Path) -> dict[str, int]:
     finally:
         db.close()
     return {"sessions": 3, "messages": 21}
+
+
+def test_recovery_preserves_delivery_obligations(tmp_path: Path) -> None:
+    source = tmp_path / "delivery-source.db"
+    output = tmp_path / "delivery-recovered.db"
+    db = SessionDB(db_path=source)
+    try:
+        db.create_session("delivery-session", "telegram", cwd="/tmp/delivery")
+        delivery_ledger._initialize_schema(db._conn)
+        db._conn.execute(
+            """
+            INSERT INTO delivery_obligations (
+                obligation_id, session_key, platform, chat_id, thread_id,
+                content, state, attempts, created_at, updated_at,
+                owner_pid, owner_started_at, last_error, adapter_profile
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "obligation-1",
+                "telegram:chat:topic",
+                "telegram",
+                "chat",
+                "topic",
+                "irreplaceable final response",
+                "failed",
+                1,
+                1.0,
+                2.0,
+                123,
+                456,
+                "send_path_degraded",
+                "default",
+            ),
+        )
+    finally:
+        db.close()
+
+    report = recover_session_database(source, output, work_dir=tmp_path)
+
+    assert report["verified"] is True
+    assert report["copy"]["delivery_obligations"]["status"] == "complete"
+    assert report["verification"]["table_counts"]["delivery_obligations"] == 1
+    with sqlite3.connect(output) as conn:
+        row = conn.execute(
+            "SELECT obligation_id, content, state, adapter_profile "
+            "FROM delivery_obligations"
+        ).fetchone()
+    assert row == (
+        "obligation-1",
+        "irreplaceable final response",
+        "failed",
+        "default",
+    )
 
 
 def _orphan_fts_schema(path: Path) -> None:
@@ -646,6 +700,5 @@ def test_partial_recovery_clears_only_unreadable_system_prompt_refs(
         )
     finally:
         conn.close()
-
 
 
