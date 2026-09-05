@@ -1,155 +1,119 @@
-"""Pair loop protection for bot-to-bot messaging.
+"""Dispatch-time bot budgets, adapted from 69k4xmdfm2-blip's PR #91483.
 
-Telegram Bot API 10.0 (2026-05-08) allows bots to receive messages from other
-bots.  The platform ships NO loop guard: core.telegram.org/api/bots/bot-to-bot
-states plainly that "Bot-to-bot communication can create infinite reply loops.
-Bots using this feature must make bot-message handling terminate predictably"
-and lists the required safeguards:
-
-  * Deduplicate repeated messages.
-  * Apply per-chat and per-bot rate limits.
-  * Enforce maximum interaction depth and timeouts, both globally and per
-    sender/receiver pair.
-
-This module implements a sliding-window budget per (conversation, bot pair).
-The pair is tracked order-independently -- A->B and B->A count as the SAME
-pair -- so a two-bot ping-pong burns one shared budget instead of two.
-
-Observed failure this guards against (2026-08-21, profiles medicina + ytmed):
-132 messages exchanged in a single Telegram group before a human intervened.
-TELEGRAM_ALLOW_BOTS=mentions did NOT stop it: when bot A replies to bot B, the
-reply itself satisfies the "mention" test, so each turn re-armed the other bot.
-
-Tunables (env, all optional):
-  HERMES_BOT_LOOP_PROTECTION   on|off           (default on)
-  HERMES_BOT_LOOP_MAX_EVENTS   int              (default 20)
-  HERMES_BOT_LOOP_WINDOW_SEC   int              (default 60)
-  HERMES_BOT_LOOP_COOLDOWN_SEC int              (default 60)
-
-Defaults match the OpenClaw reference implementation (20 events / 60 s window /
-60 s cooldown), which solves the same problem on Discord, Slack, Matrix,
-Feishu and Google Chat.
+Retains the conversation-wide sliding window, not its stateful authorization
+check or cooldown: elapsed time must never reset the human-bounded hop count.
+State belongs to one runner and is isolated by profile/platform/chat/thread.
 """
 
 from __future__ import annotations
 
-import os
+import logging
 import threading
 import time
 from collections import deque
-from typing import Deque, Dict, Optional, Tuple
+from dataclasses import dataclass, field
 
-__all__ = ["allow_bot_event", "loop_guard_state", "reset_loop_guard"]
+from gateway.config import Platform
+from hermes_constants import get_hermes_home
+
+logger = logging.getLogger(__name__)
 
 
-def _env_int(name: str, default: int) -> int:
-    raw = os.getenv(name)
-    if not raw:
+def _positive_int(settings: dict, key: str, default: int) -> int:
+    value = settings.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
         return default
     try:
-        val = int(str(raw).strip())
-    except (TypeError, ValueError):
+        parsed = int(value)
+    except ValueError:
         return default
-    return val if val > 0 else default
+    return parsed if parsed > 0 else default
 
 
-def _enabled() -> bool:
-    raw = (os.getenv("HERMES_BOT_LOOP_PROTECTION") or "on").strip().lower()
-    return raw not in {"off", "false", "0", "no", "disabled"}
+@dataclass
+class _Conversation:
+    events: deque = field(default_factory=deque)
+    seen: set = field(default_factory=set)
+    hops: int = 0
+    human_id: int = 0
 
 
-_LOCK = threading.Lock()
-# key -> (deque of event timestamps, cooldown_until)
-_EVENTS: Dict[Tuple[str, str, str], Deque[float]] = {}
-_COOLDOWN: Dict[Tuple[str, str, str], float] = {}
-_LAST_SWEEP = 0.0
+class BotLoopGuard:
+    """No stale-bucket eviction: forgetting a hop count reopens a slow loop.
 
-
-def _key(scope: str, conversation: str, a: str, b: str) -> Tuple[str, str, str]:
-    """Order-independent pair key: A->B and B->A collapse to one bucket."""
-    lo, hi = sorted([str(a or "?"), str(b or "?")])
-    return (str(scope or "-"), str(conversation or "-"), f"{lo}|{hi}")
-
-
-def _sweep(now: float, window: float) -> None:
-    """Drop buckets untouched for 10 windows so memory stays bounded."""
-    global _LAST_SWEEP
-    if now - _LAST_SWEEP < window:
-        return
-    _LAST_SWEEP = now
-    horizon = now - (window * 10)
-    for k in [k for k, dq in _EVENTS.items() if not dq or dq[-1] < horizon]:
-        _EVENTS.pop(k, None)
-        if _COOLDOWN.get(k, 0.0) < now:
-            _COOLDOWN.pop(k, None)
-
-
-def allow_bot_event(
-    scope: str,
-    conversation: str,
-    sender_bot: str,
-    receiver_bot: str,
-    *,
-    now: Optional[float] = None,
-) -> Tuple[bool, str]:
-    """Return (allowed, reason) for one inbound bot-authored message.
-
-    Call ONLY for messages authored by another bot, at the moment the message
-    is admitted. Human traffic must never reach this function.
+    Only admitted bot IDs in the current chain are retained (bounded by
+    max_hops). The human message watermark rejects replays from older chains.
+    Restarting the runner clears state; this is not a distributed hop protocol.
     """
-    if not _enabled():
-        return True, "guard-disabled"
 
-    max_events = _env_int("HERMES_BOT_LOOP_MAX_EVENTS", 20)
-    window = float(_env_int("HERMES_BOT_LOOP_WINDOW_SEC", 60))
-    cooldown = float(_env_int("HERMES_BOT_LOOP_COOLDOWN_SEC", 60))
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._conversations = {}
 
-    t = time.monotonic() if now is None else now
-    k = _key(scope, conversation, sender_bot, receiver_bot)
-
-    with _LOCK:
-        _sweep(t, window)
-
-        until = _COOLDOWN.get(k, 0.0)
-        if until > t:
-            return False, f"cooldown:{until - t:.0f}s-left"
-
-        dq = _EVENTS.setdefault(k, deque())
-        cutoff = t - window
-        while dq and dq[0] < cutoff:
-            dq.popleft()
-
-        if len(dq) >= max_events:
-            _COOLDOWN[k] = t + cooldown
-            dq.clear()
-            return False, f"budget-exceeded:{max_events}/{window:.0f}s"
-
-        dq.append(t)
-        return True, f"ok:{len(dq)}/{max_events}"
-
-
-def loop_guard_state() -> dict:
-    """Snapshot for diagnostics."""
-    t = time.monotonic()
-    with _LOCK:
-        return {
-            "enabled": _enabled(),
-            "max_events": _env_int("HERMES_BOT_LOOP_MAX_EVENTS", 20),
-            "window_seconds": _env_int("HERMES_BOT_LOOP_WINDOW_SEC", 60),
-            "cooldown_seconds": _env_int("HERMES_BOT_LOOP_COOLDOWN_SEC", 60),
-            "tracked_pairs": len(_EVENTS),
-            "pairs": {
-                "|".join(k): len(dq) for k, dq in list(_EVENTS.items())[:20]
-            },
-            "cooling_down": {
-                "|".join(k): round(v - t, 1)
-                for k, v in _COOLDOWN.items()
-                if v > t
-            },
-        }
+    def admit(self, key: tuple, message_id: str, is_bot: bool, settings: dict) -> bool:
+        try:
+            mid = int(message_id)
+        except (TypeError, ValueError):
+            return not is_bot  # native Telegram messages always have numeric IDs
+        if mid <= 0:
+            return not is_bot
+        with self._lock:
+            state = self._conversations.setdefault(key, _Conversation())
+            if not is_bot:
+                if mid > state.human_id:
+                    state.human_id = mid
+                    state.hops = 0
+                    state.seen.clear()
+                return True
+            if mid <= state.human_id or mid in state.seen:
+                return False
+            max_hops = _positive_int(settings, "max_hops", 8)
+            if state.hops >= max_hops:
+                return False
+            max_events = _positive_int(settings, "max_events", 20)
+            window = _positive_int(settings, "window_seconds", 60)
+            now = time.monotonic()
+            while state.events and state.events[0] <= now - window:
+                state.events.popleft()
+            if len(state.events) >= max_events:
+                return False
+            state.events.append(now)
+            state.seen.add(mid)
+            state.hops += 1
+            if state.hops == max_hops:
+                logger.warning("Telegram bot hop limit reached for %s; waiting for an authorized human", key)
+            return True
 
 
-def reset_loop_guard() -> None:
-    with _LOCK:
-        _EVENTS.clear()
-        _COOLDOWN.clear()
+def admit_telegram_bot_turn(runner, event) -> bool:
+    """Call exactly once, after auth + native trigger gates, before dispatch.
+
+    Passive observations never enter the runner. Humans and DMs are unmetered;
+    bot commands cannot reach administrative or pending-control intercepts.
+    """
+    source = event.source
+    if source.platform != Platform.TELEGRAM:
+        return True
+    is_bot = getattr(source, "is_bot", False)
+    if is_bot and event.get_command():
+        return False
+    if source.chat_type not in {"group", "forum", "channel"}:
+        return True
+    if not is_bot:
+        # Observe mode strips source.user_id; native from_user still proves a
+        # human sender. Anonymous admins/channel posts cannot re-arm a chain.
+        raw = event.raw_message
+        human_id = getattr(getattr(raw, "from_user", None), "id", None) if raw is not None else source.user_id
+        if not human_id:
+            return True
+    adapter = runner._adapter_for_source(source)
+    extra = adapter.config.extra if adapter is not None else {}
+    settings = extra.get("bot_loop", {})
+    if not isinstance(settings, dict):
+        settings = {}
+    guard = getattr(runner, "_telegram_bot_loop_guard", None)
+    if guard is None:
+        guard = runner._telegram_bot_loop_guard = BotLoopGuard()
+    profile = source.profile or getattr(adapter, "_owner_profile", None) or str(get_hermes_home())
+    key = (profile, source.platform.value, str(source.chat_id), str(source.thread_id or ""))
+    return guard.admit(key, event.message_id, is_bot, settings)

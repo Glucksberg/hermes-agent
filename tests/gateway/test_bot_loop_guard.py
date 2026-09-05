@@ -1,238 +1,235 @@
-"""Bot-to-bot pair loop protection (Telegram Bot API 10.0).
+"""Native Telegram ingress invariants; based on the incident in PR #91483."""
 
-Telegram ships no loop guard of its own: core.telegram.org/api/bots/bot-to-bot
-requires the BOT to "make bot-message handling terminate predictably" via
-dedupe, rate limits and maximum interaction depth per sender/receiver pair.
-
-Every test here was verified FAILING against the tree without the guard
-(mutation-checked), which matters more than the count: exercising the real
-configuration is what makes them meaningful.  In particular they run with
-TELEGRAM_GROUP_ALLOWED_CHATS set, because that env var short-circuits
-_is_user_authorized with `return True` ~32 lines before the is_bot block --
-a guard placed in the is_bot block would never run for the one configuration
-that needs it, and a test without the allowlist would go green through a
-different code path.
-"""
-
+import asyncio
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
+import yaml
 
-from gateway.session import Platform, SessionSource
-
-GROUP_CHAT = "-1001234567890"
-OTHER_GROUP = "-1009876543210"
-
-
-@pytest.fixture(autouse=True)
-def _isolate_env(monkeypatch):
-    for var in (
-        "TELEGRAM_ALLOW_BOTS",
-        "TELEGRAM_ALLOWED_USERS",
-        "TELEGRAM_ALLOW_ALL_USERS",
-        "TELEGRAM_GROUP_ALLOWED_USERS",
-        "TELEGRAM_GROUP_ALLOWED_CHATS",
-        "GATEWAY_ALLOW_ALL_USERS",
-        "GATEWAY_ALLOWED_USERS",
-        "HERMES_BOT_LOOP_PROTECTION",
-        "HERMES_BOT_LOOP_MAX_EVENTS",
-        "HERMES_BOT_LOOP_WINDOW_SEC",
-        "HERMES_BOT_LOOP_COOLDOWN_SEC",
-    ):
-        monkeypatch.delenv(var, raising=False)
-
-    from gateway.bot_loop_guard import reset_loop_guard
-
-    reset_loop_guard()
-    yield
-    reset_loop_guard()
+from gateway.config import Platform, load_gateway_config
+from gateway.session import SessionStore
+from tests.gateway.test_telegram_auth_check import _make_adapter, _make_message
 
 
 @pytest.fixture
-def fake_clock(monkeypatch):
-    """Drive the guard's sliding window deterministically."""
+def pipeline(monkeypatch, tmp_path):
     from gateway import bot_loop_guard
-
-    state = {"t": 1_000_000.0}
-    monkeypatch.setattr(bot_loop_guard.time, "monotonic", lambda: state["t"])
-    return SimpleNamespace(
-        advance=lambda secs: state.__setitem__("t", state["t"] + secs),
-        now=lambda: state["t"],
-    )
-
-
-def _runner():
     from gateway.run import GatewayRunner
 
+    for name in ("TELEGRAM_ALLOW_BOTS", "TELEGRAM_ALLOWED_USERS", "TELEGRAM_ALLOW_ALL_USERS",
+                 "TELEGRAM_GROUP_ALLOWED_CHATS", "TELEGRAM_GROUP_ALLOWED_USERS",
+                 "GATEWAY_ALLOW_ALL_USERS", "GATEWAY_ALLOWED_USERS"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    clock = SimpleNamespace(t=1000.0)
+    monkeypatch.setattr(bot_loop_guard.time, "monotonic", lambda: clock.t)
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump({"telegram": {
+        "allow_bots": "mentions", "allow_from": ["111"],
+        "allowed_chats": ["-100", "-200"], "group_allowed_chats": ["-100", "-200"],
+        "bot_loop": {"max_events": 2, "window_seconds": 60, "max_hops": 4},
+    }}))
+    config = load_gateway_config()
     runner = object.__new__(GatewayRunner)
-    runner.pairing_store = SimpleNamespace(is_approved=lambda *_a, **_kw: False)
-    return runner
+    runner.config = config
+    runner.session_store = SessionStore(sessions_dir=tmp_path / "sessions", config=config)
+    runner.pairing_store = SimpleNamespace(is_approved=lambda *a: False)
+    adapter = _make_adapter(require_mention=True)
+    adapter.config = config.platforms[Platform.TELEGRAM]
+    adapter._session_store = runner.session_store
+    adapter._owner_profile = "mito"
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    # Observation stamps the owning profile before dispatch; register the same
+    # test transport under both explicitly exercised profile routes.
+    runner._profile_adapters = {
+        profile: {Platform.TELEGRAM: adapter} for profile in ("mito", "trump")
+    }
+    adapter._message_handler = runner._handle_message
+    # Keep native prefilter, trigger gating, event construction, and runner auth;
+    # replace only scheduling/agent execution and the Telegram network transport.
+    adapter.handle_message = runner._handle_message
+    adapter._ensure_forum_commands = AsyncMock()
+    queued = []
+    adapter._enqueue_text_event = queued.append
+    runner._hm_estop_gate = lambda *a: None
+    delivered = []
+
+    async def capture(event, source, key):
+        delivered.append(event)
+        return "fake-agent-response"
+
+    runner._hm_pending_reply_intercepts = capture
+
+    async def send(mid, *, bot=True, media=False, text="@test_bot hello", chat=-100,
+                   thread=None, profile="mito", command=False, private=False, sender=None, anonymous=False):
+        adapter._owner_profile = profile
+        msg = _make_message(text=None if media else text, from_user_id=sender or (222 if bot else 111),
+                            chat_id=chat, chat_type="private" if private else "supergroup")
+        msg.message_id = mid
+        msg.from_user.is_bot = bot
+        if anonymous:
+            msg.from_user = None
+        msg.message_thread_id = thread
+        msg.is_topic_message = thread is not None
+        msg.chat.is_forum = thread is not None
+        msg.caption = text if media else None
+        entities = [SimpleNamespace(type="mention", offset=0, length=9)] if text.startswith("@test_bot") else []
+        msg.entities = [] if media else entities
+        msg.caption_entities = entities if media else []
+        if media:
+            file = SimpleNamespace(file_path="test.ogg", download_as_bytearray=AsyncMock(return_value=b"fake voice"))
+            msg.voice = SimpleNamespace(file_size=10, get_file=AsyncMock(return_value=file))
+        before = len(delivered)
+        handler = adapter._handle_command if command else (adapter._handle_media_message if media else adapter._handle_text_message)
+        await handler(SimpleNamespace(update_id=mid, message=msg, effective_message=msg), SimpleNamespace())
+        while queued:
+            await adapter.handle_message(queued.pop(0))
+        return len(delivered) - before
+
+    return SimpleNamespace(send=send, runner=runner, adapter=adapter, clock=clock, delivered=delivered)
 
 
-def _bot(user_id: str, chat_id: str = GROUP_CHAT) -> SessionSource:
-    """A fresh inbound bot message.
+@pytest.mark.asyncio
+@pytest.mark.parametrize("media", [False, True])
+async def test_native_bot_admission_is_not_control_or_a_chat_gate_bypass(pipeline, media):
+    from gateway.platforms.base import BasePlatformAdapter
 
-    A new SessionSource per turn, mirroring production (each update builds its
-    own).  A hand-rolled stub does not work here: _is_user_authorized touches
-    delivered_via_upstream_relay and other real fields and blows up with
-    AttributeError.
-    """
-    source = SessionSource(
-        platform=Platform.TELEGRAM,
-        chat_id=chat_id,
-        chat_type="group",
-        user_id=user_id,
-        user_name=f"Bot{user_id}",
-    )
-    source.is_bot = True
-    return source
+    p = pipeline
+    # Even an open/free-response group only admits explicitly addressed bots in mentions mode.
+    p.adapter.config.extra["require_mention"] = False
+    assert await p.send(1, media=media, text="passive bot report") == 0
+    assert await p.send(2, media=media, chat=-999) == 0
+    p.adapter.config.extra["guest_mode"] = True
+    assert await p.send(3, media=media, chat=-999) == 0
+    p.adapter.config.extra["guest_mode"] = False
+    assert await p.send(4, media=media) == 1
+    assert p.delivered[-1].allow_gateway_control is False
+    assert await p.send(5, media=media) == 1  # passive/rejected traffic used no budget
+    assert await p.send(6, media=media) == 0
+    assert await p.send(4, media=media, thread=17) == 1
+    assert await p.send(4, media=media, chat=-200) == 1
+    assert await p.send(4, media=media, profile="trump") == 1
+    # Human DMs don't share group state; anonymous/non-triggering human chatter cannot reset it.
+    assert await p.send(7, bot=False, private=True) == 1
+    p.adapter.config.extra["require_mention"] = True
+    assert await p.send(8, bot=False, media=media, text="side chatter") == 0
+    assert await p.send(9, media=media) == 0
 
-
-def _human(user_id: str = "100200300", chat_id: str = GROUP_CHAT, chat_type: str = "group") -> SessionSource:
-    source = SessionSource(
-        platform=Platform.TELEGRAM,
-        chat_id=chat_id,
-        chat_type=chat_type,
-        user_id=user_id,
-        user_name="Alice",
-    )
-    source.is_bot = False
-    return source
-
-
-def _real_config(monkeypatch, *, max_events="20"):
-    """The configuration that actually reproduces the incident."""
-    monkeypatch.setenv("TELEGRAM_ALLOW_BOTS", "mentions")
-    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "100200300")
-    # The short-circuit that makes guard placement matter.
-    monkeypatch.setenv("TELEGRAM_GROUP_ALLOWED_CHATS", f"{GROUP_CHAT},{OTHER_GROUP}")
-    monkeypatch.setenv("HERMES_BOT_LOOP_MAX_EVENTS", max_events)
-    monkeypatch.setenv("HERMES_BOT_LOOP_WINDOW_SEC", "60")
-    monkeypatch.setenv("HERMES_BOT_LOOP_COOLDOWN_SEC", "60")
-
-
-# --------------------------------------------------------------------------- 1
-
-
-def test_ping_pong_of_40_turns_is_cut_at_turn_21(monkeypatch, fake_clock):
-    """The incident, reduced: two bots replying to each other must terminate.
-
-    Observed 2026-08-21 in production: 132 messages between two Hermes profiles
-    in one group before a human intervened.  With a budget of 20 the 21st
-    inbound bot message must be suppressed.
-    """
-    _real_config(monkeypatch, max_events="20")
-    runner = _runner()
-
-    verdicts = []
-    for turn in range(40):
-        sender = "111111111" if turn % 2 == 0 else "222222222"
-        verdicts.append(runner._is_user_authorized(_bot(sender)))
-
-    assert verdicts[:20] == [True] * 20, "first 20 turns must pass"
-    assert verdicts[20] is False, "turn 21 must be suppressed"
-    assert not any(verdicts[20:]), "the exchange must not resume inside cooldown"
+    # Exercise the real Base active-session command guard: /stop must not cancel
+    # an in-flight human task, regardless of native COMMAND vs text/caption path.
+    original_handle = p.adapter.handle_message
+    p.adapter.handle_message = BasePlatformAdapter.handle_message.__get__(p.adapter)
+    p.adapter._event_session_key = lambda event: "human-busy"
+    p.adapter._active_sessions["human-busy"] = asyncio.Event()
+    p.adapter._heal_stale_session_lock = lambda key: None
+    p.adapter._dispatch_active_session_command = AsyncMock()
+    for command in (False, True):
+        assert await p.send(10, media=media and not command, text="/stop@test_bot", command=command) == 0
+    p.adapter._dispatch_active_session_command.assert_not_awaited()
+    assert not p.adapter._active_sessions["human-busy"].is_set()
+    p.adapter.handle_message = original_handle
+    p.adapter.config.extra["require_mention"] = False
+    p.adapter.config.extra["allow_bots"] = "none"
+    assert await p.send(20, media=media, profile="policy") == 0
+    p.adapter.config.extra["allow_bots"] = "all"
+    p.adapter.config.extra["group_policy"] = "disabled"
+    assert await p.send(20, media=media, profile="policy") == 0
+    p.adapter.config.extra["group_policy"] = "open"
+    p.adapter.config.extra["bot_loop"] = {"max_hops": 1.5, "max_events": False, "window_seconds": []}
+    assert await p.send(20, media=media, profile="policy", text="bot report") == 1
+    assert await p.send(21, media=media, profile="policy", text="bot report") == 1
 
 
-# --------------------------------------------------------------------------- 2
+@pytest.mark.asyncio
+@pytest.mark.parametrize("media", [False, True])
+@pytest.mark.parametrize("observe", [False, True])
+async def test_one_dispatch_one_budget_and_slow_chain_requires_human(pipeline, media, observe):
+    p = pipeline
+    p.adapter.config.extra["observe_unmentioned_group_messages"] = observe
+    assert await p.send(1, bot=False, media=media) == 1
+    assert await p.send(2, media=media) == 1
+    # Authorization can be asked any number of times without spending budget.
+    for _ in range(5):
+        assert p.runner._is_user_authorized(p.delivered[-1].source)
+    assert await p.send(2, media=media) == 0  # fresh update object, same native message ID
+    assert await p.send(3, media=media, sender=333) == 1
+    assert await p.send(4, media=media) == 0  # sliding-window rate limit
+    p.clock.t += 61
+    assert await p.send(5, media=media) == 1
+    p.clock.t += 61
+    assert await p.send(6, media=media) == 1
+    for mid in (7, 8, 9):
+        p.clock.t += 10000
+        assert await p.send(mid, media=media) == 0  # no time-based hard-cap reset
+    assert await p.send(9, bot=False, media=media, anonymous=True) == 1
+    assert await p.send(12, media=media) == 0  # anonymous/channel posts are not human intervention
+    assert await p.send(1, bot=False, media=media) == 1
+    assert await p.send(9, media=media) == 0  # replay of the initiating human is not a new chain
+    assert await p.send(10, bot=False, media=media) == 1
+    assert await p.send(11, media=media) == 1
+    assert await p.send(10, bot=False, media=media) == 1  # humans remain unaffected
+    assert await p.send(11, media=media) == 0  # replayed human must not reset bot dedupe
 
 
-def test_human_in_same_group_still_authorized_during_cooldown(monkeypatch, fake_clock):
-    """The guard must never take the group down for people."""
-    _real_config(monkeypatch, max_events="20")
-    runner = _runner()
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["interrupt", "steer", "queue"])
+async def test_native_busy_admission_shares_cold_budget_and_consumes_receipt_once(pipeline, mode, monkeypatch):
+    monkeypatch.setenv("HERMES_GATEWAY_BUSY_ACK_ENABLED", "false")
+    p = pipeline
+    runner = p.runner
+    runner._sessions = {}
+    runner._draining = False
+    runner._restart_requested = False
+    runner._busy_input_mode = mode
+    runner._busy_text_mode = "queue"
+    runner.config.group_sessions_per_user = False
+    p.adapter.config.extra["group_sessions_per_user"] = False
+    assert await p.send(1, bot=False) == 1  # initiating human predates the first bot
+    assert await p.send(2) == 1  # cold ingress spends the same budget
+    cold_handle = p.adapter.handle_message
 
-    for turn in range(25):
-        runner._is_user_authorized(_bot("111111111" if turn % 2 == 0 else "222222222"))
+    async def busy(event):
+        key = runner._session_key_for_source(event.source)
+        await runner._handle_active_session_busy_message(event, key)
 
-    assert runner._is_user_authorized(_bot("111111111")) is False, "precondition: bots are cooling down"
-    assert runner._is_user_authorized(_human()) is True
-    fake_clock.advance(5)
-    assert runner._is_user_authorized(_human()) is True
+    p.adapter.handle_message = busy
+    await p.send(3)
+    key = runner._session_key_for_source(p.delivered[0].source)
+    peer = p.adapter._pending_messages[key]
+    assert peer.message_id == "3"
+    await busy(peer)  # the same event object must not reuse its queue receipt
+    await p.send(3)  # nor may a fresh update replay the native ID
+    assert runner._queue_depth(key, adapter=p.adapter) == 1
+    await p.send(4)
+    assert runner._queue_depth(key, adapter=p.adapter) == 1  # rate limit
+    p.clock.t += 61
+    await p.send(5)
+    p.clock.t += 61
+    await p.send(6)
+    assert runner._queue_depth(key, adapter=p.adapter) == 3
+    p.clock.t += 10000
+    await p.send(7)
+    assert runner._queue_depth(key, adapter=p.adapter) == 3  # hard hop cap
 
+    # Base's fallback drain re-enters cold admission; the exact queued event
+    # gets one pass, not another charge (or a permanent dedupe exemption).
+    assert await runner._hm_admit_event(peer) is None  # still queued: redelivery, not handoff
+    assert p.adapter._pending_messages.pop(key) is peer
+    assert await runner._hm_admit_event(peer) is not None
+    assert await runner._hm_admit_event(peer) is None
+    await p.send(8, bot=False, anonymous=True)
+    await p.send(9, bot=False, sender=999)
+    await p.send(1, bot=False)  # old human replay cannot reopen the chain
+    depth = runner._queue_depth(key, adapter=p.adapter)
+    await p.send(10)
+    assert runner._queue_depth(key, adapter=p.adapter) == depth
+    await p.send(11, bot=False)
+    depth = runner._queue_depth(key, adapter=p.adapter)
+    await p.send(12)
+    assert runner._queue_depth(key, adapter=p.adapter) == depth + 1
 
-# --------------------------------------------------------------------------- 3
-
-
-def test_human_dm_unaffected(monkeypatch, fake_clock):
-    """Human DMs never enter the guard at all."""
-    monkeypatch.setenv("TELEGRAM_ALLOW_BOTS", "mentions")
-    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "100200300")
-    monkeypatch.setenv("HERMES_BOT_LOOP_MAX_EVENTS", "20")
-    runner = _runner()
-
-    for _ in range(50):
-        assert runner._is_user_authorized(_human(chat_id="123", chat_type="dm")) is True
-
-    from gateway.bot_loop_guard import loop_guard_state
-
-    assert loop_guard_state()["tracked_pairs"] == 0, "human traffic must not be metered"
-
-
-# --------------------------------------------------------------------------- 4
-
-
-def test_three_bots_in_one_group_share_a_single_budget(monkeypatch, fake_clock):
-    """Budget is keyed per CONVERSATION, not per (sender, receiver).
-
-    This process only sees inbound messages, so the receiver is a constant.
-    Keying on the pair would hand each sender its own budget, and N bots would
-    need N x budget messages to trip a guard meant to cap the whole exchange.
-    """
-    _real_config(monkeypatch, max_events="20")
-    runner = _runner()
-    senders = ["111111111", "222222222", "333333333"]
-
-    verdicts = [runner._is_user_authorized(_bot(senders[i % 3])) for i in range(30)]
-
-    assert verdicts[:20] == [True] * 20
-    assert not any(verdicts[20:]), "three bots must not get 3 x budget"
-
-
-# --------------------------------------------------------------------------- 5
-
-
-def test_other_group_has_its_own_budget(monkeypatch, fake_clock):
-    """One noisy group must not silence bots elsewhere."""
-    _real_config(monkeypatch, max_events="20")
-    runner = _runner()
-
-    for turn in range(25):
-        runner._is_user_authorized(_bot("111111111" if turn % 2 == 0 else "222222222"))
-    assert runner._is_user_authorized(_bot("111111111")) is False
-
-    assert runner._is_user_authorized(_bot("111111111", chat_id=OTHER_GROUP)) is True
-    assert runner._is_user_authorized(_bot("222222222", chat_id=OTHER_GROUP)) is True
-
-
-# --------------------------------------------------------------------------- 6
-
-
-def test_slow_traffic_never_blocks(monkeypatch, fake_clock):
-    """1 message / 10 s for 10 minutes: legitimate pace, zero false positives."""
-    _real_config(monkeypatch, max_events="20")
-    runner = _runner()
-
-    verdicts = []
-    for turn in range(60):
-        verdicts.append(runner._is_user_authorized(_bot("111111111" if turn % 2 == 0 else "222222222")))
-        fake_clock.advance(10)
-
-    assert all(verdicts), f"slow traffic blocked at index {verdicts.index(False) if not all(verdicts) else -1}"
-
-
-# --------------------------------------------------------------------------- 7
-
-
-def test_kill_switch_disables_the_guard(monkeypatch, fake_clock):
-    """HERMES_BOT_LOOP_PROTECTION=off restores the previous behaviour exactly."""
-    _real_config(monkeypatch, max_events="20")
-    monkeypatch.setenv("HERMES_BOT_LOOP_PROTECTION", "off")
-    runner = _runner()
-
-    verdicts = [
-        runner._is_user_authorized(_bot("111111111" if turn % 2 == 0 else "222222222"))
-        for turn in range(40)
-    ]
-
-    assert all(verdicts), "kill switch must suppress the guard entirely"
+    # A metadata field supplied with an event is not an admission receipt.
+    p.adapter.handle_message = cold_handle
+    peer.metadata["_hermes_bot_budget_admitted"] = True
+    assert await runner._hm_admit_event(peer) is None

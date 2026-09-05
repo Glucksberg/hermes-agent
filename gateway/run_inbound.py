@@ -196,6 +196,22 @@ class GatewayInboundMixin:
             ):
                 await self._hm_offer_pairing_code(source)
             return None
+        if self._is_telegram_peer_event(event) and self._draining and not self._queue_during_drain_enabled(
+            self._effective_busy_input_mode(source)
+        ):
+            return None  # shutdown rejection must precede budget charging
+        from gateway.bot_loop_guard import admit_telegram_bot_turn
+        # Base's fallback cascade may dispatch a peer already charged by busy
+        # admission. This private, event-only receipt is single-use, never metadata.
+        if event.__dict__.get("_hermes_bot_budget_admitted") is True:
+            adapter = self._adapter_for_source(source)
+            key = self._session_key_for_source(source)
+            queued = [getattr(adapter, "_pending_messages", {}).get(key), *(self._overflow_queue(key) or ())]
+            if any(item is event for item in queued):
+                return None  # a redelivery is not the queued event's cold handoff
+        admitted_while_busy = event.__dict__.pop("_hermes_bot_budget_admitted", False) is True
+        if not admitted_while_busy and not admit_telegram_bot_turn(self, event):
+            return None
         return event, source, False
 
     def _hm_estop_turn_allowed(self, event: "MessageEvent", source: SessionSource) -> bool:
@@ -489,7 +505,11 @@ class GatewayInboundMixin:
         from gateway.platforms.base import merge_pending_message_event
         adapter = self._adapter_for_source(source)
         if adapter:
-            merge_pending_message_event(adapter._pending_messages, _quick_key, event, merge_text=merge_text)
+            queued = [adapter._pending_messages.get(_quick_key), *(self._overflow_queue(_quick_key) or ())]
+            if self._is_telegram_peer_event(event) or any(self._is_telegram_peer_event(item) for item in queued):
+                self._queue_or_replace_pending_event(_quick_key, event)
+            else:
+                merge_pending_message_event(adapter._pending_messages, _quick_key, event, merge_text=merge_text)
 
     async def _hm_busy_slash_or_photo(
         self, event: "MessageEvent", source: SessionSource, _quick_key: str
@@ -600,6 +620,8 @@ class GatewayInboundMixin:
         """Fast-path while this session's agent is running: interrupt by default (minimal latency);
         busy_input_mode queue/steer, subagent and compression protection demote to queue."""
         from gateway.run import _AGENT_PENDING_SENTINEL
+        if self._queue_busy_peer_event(event, _quick_key, pre_admitted=True):
+            return None
         _handled, _result = await self._hm_busy_slash_or_photo(event, source, _quick_key)
         if _handled:
             return _result

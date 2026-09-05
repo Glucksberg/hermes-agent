@@ -275,6 +275,14 @@ class GatewayBusySessionMixin:
         "gateway_session_id", "gateway_session_strict",
     )
 
+    @staticmethod
+    def _is_telegram_peer_event(event: Optional[MessageEvent]) -> bool:
+        source = getattr(event, "source", None)
+        return (
+            getattr(source, "platform", None) == Platform.TELEGRAM
+            and getattr(source, "is_bot", False) is True
+        )
+
     def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> None:
         from gateway.platforms.base import merge_pending_message_event
         adapter = self._adapter_for_source(event.source)
@@ -297,7 +305,13 @@ class GatewayBusySessionMixin:
                 for key in self._SECURITY_METADATA_KEYS
             )
         )
-        if same_security_context and (
+        # A peer handoff owns its original payload/reply anchor, even with media. Neither
+        # another peer nor a human photo burst may merge into it (or vice versa).
+        peer_handoff = (
+            self._is_telegram_peer_event(existing) or self._is_telegram_peer_event(event)
+            or any(self._is_telegram_peer_event(queued) for queued in self._overflow_queue(session_key) or ())
+        )
+        if same_security_context and not peer_handoff and (
             getattr(existing, "message_type", None) == MessageType.PHOTO
             or event.message_type == MessageType.PHOTO
             or bool(getattr(existing, "media_urls", None))
@@ -600,6 +614,26 @@ class GatewayBusySessionMixin:
         except Exception as e:
             logger.debug("Failed to send busy-ack: %s", e)
 
+    def _queue_busy_peer_event(
+        self, event: MessageEvent, session_key: str, *, pre_admitted: bool = False
+    ) -> bool:
+        """Consume native peer work before any human control/photo shortcuts.
+
+        Only the runner's cold ingress may pass pre_admitted; Base deliveries must
+        always recheck budget/dedupe, even when redelivering the same event object.
+        """
+        if not self._is_telegram_peer_event(event):
+            return False
+        if self._draining and not self._queue_during_drain_enabled(
+            self._effective_busy_input_mode(event.source)
+        ):
+            return True
+        from gateway.bot_loop_guard import admit_telegram_bot_turn
+        if pre_admitted or admit_telegram_bot_turn(self, event):
+            event.__dict__["_hermes_bot_budget_admitted"] = True
+            self._queue_or_replace_pending_event(session_key, event)
+        return True
+
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
         # Same authorization gate as the cold path, else unauthorized users in shared threads
         # inject messages into a session they don't own.
@@ -613,6 +647,13 @@ class GatewayBusySessionMixin:
             )
             return True  # handled (silently dropped); do not fall through
 
+        # Both native busy entrances share the same silent, budgeted FIFO policy.
+        from gateway.bot_loop_guard import admit_telegram_bot_turn
+        if self._queue_busy_peer_event(event, session_key):
+            return True
+
+        if not getattr(event, "internal", False):
+            admit_telegram_bot_turn(self, event)  # fresh authorized human intervention
         effective_mode = self._effective_busy_input_mode(event.source)
         if self._draining:  # gateway restarting/stopping
             await self._send_busy_drain_notice(event, session_key, effective_mode)
@@ -635,6 +676,13 @@ class GatewayBusySessionMixin:
             and self._effective_busy_text_mode(event.source) == "queue"
             and effective_mode != "steer"
         ):
+            # Base's queue-mode media merge only sees the head, not peer barriers
+            # in overflow. Keep this arrival in the runner FIFO when either exists.
+            if self._is_telegram_peer_event(adapter._pending_messages.get(session_key)) or any(
+                self._is_telegram_peer_event(queued) for queued in self._overflow_queue(session_key) or ()
+            ):
+                self._queue_or_replace_pending_event(session_key, event)
+                return True
             return False
 
         _busy_state = self._peek_session_state(session_key)
