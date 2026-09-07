@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock
 import pytest
 import yaml
 
+from gateway.bot_loop_guard import BotLoopGuard
 from gateway.config import Platform, load_gateway_config
 from gateway.session import SessionStore
 from tests.gateway.test_telegram_auth_check import _make_adapter, _make_message
@@ -55,11 +56,21 @@ def pipeline(monkeypatch, tmp_path):
     runner._hm_estop_gate = lambda *a: None
     delivered = []
 
-    async def capture(event, source, key):
+    async def capture(event, source, key, generation):
         delivered.append(event)
         return "fake-agent-response"
 
-    runner._hm_pending_reply_intercepts = capture
+    # Exercise the real cold acceptance gates; replace only agent execution and
+    # post-turn persistence, not an earlier control-reply intercept.
+    runner._sessions = {}
+    runner._draining = runner._external_drain_active = False
+    runner._restart_requested = False
+    runner._busy_input_mode = "queue"
+    runner._hm_pending_reply_intercepts = AsyncMock(return_value=None)
+    runner._handle_message_with_agent = capture
+    runner._run_post_turn_hooks = AsyncMock()
+    runner._persist_active_agents = lambda: None
+    runner._clear_durable_active_turn = AsyncMock()
 
     async def send(mid, *, bot=True, media=False, text="@test_bot hello", chat=-100,
                    thread=None, profile="mito", command=False, private=False, sender=None, anonymous=False):
@@ -88,6 +99,23 @@ def pipeline(monkeypatch, tmp_path):
         return len(delivered) - before
 
     return SimpleNamespace(send=send, runner=runner, adapter=adapter, clock=clock, delivered=delivered)
+
+
+def test_delayed_human_preserves_newer_peer_replay_evidence_and_hops():
+    guard = BotLoopGuard()
+    key = ("default", "telegram", "-1001", "")
+    settings = {"max_hops": 2, "max_events": 20, "window_seconds": 60}
+
+    assert guard.admit(key, "100", False, settings)
+    assert guard.admit(key, "102", True, settings)
+    assert guard.admit(key, "104", True, settings)
+    assert guard.admit(key, "101", False, settings)  # delayed human
+    assert not guard.admit(key, "102", True, settings)
+    assert not guard.admit(key, "104", True, settings)
+    assert not guard.admit(key, "103", True, settings)  # surviving peers retain both hops
+
+    assert guard.admit(key, "105", False, settings)  # genuinely newer human resets
+    assert guard.admit(key, "106", True, settings)
 
 
 @pytest.mark.asyncio
@@ -233,3 +261,68 @@ async def test_native_busy_admission_shares_cold_budget_and_consumes_receipt_onc
     p.adapter.handle_message = cold_handle
     peer.metadata["_hermes_bot_budget_admitted"] = True
     assert await runner._hm_admit_event(peer) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("refusal", ["pause", "external_drain", "session_cap"])
+async def test_cold_refusal_preserves_peer_budget_for_retry(pipeline, monkeypatch, tmp_path, refusal):
+    from agent import estop
+    from gateway.run_inbound import GatewayInboundMixin
+    from hermes_cli.active_sessions import try_acquire_active_session
+
+    p = pipeline
+    p.adapter.config.extra["bot_loop"] = {"max_hops": 1, "max_events": 1}
+    lease = None
+    # Restore the real pause gate, confined to this test's Hermes home.
+    monkeypatch.setattr(estop, "_canonical_root", lambda: tmp_path)
+    p.runner._hm_estop_gate = GatewayInboundMixin._hm_estop_gate.__get__(p.runner)
+    if refusal == "pause":
+        estop.engage("peer acceptance test")
+    elif refusal == "external_drain":
+        p.runner._external_drain_active = True
+    else:
+        p.runner.config.max_concurrent_sessions = 1
+        lease, error = try_acquire_active_session(
+            session_id="other-active-session", surface="test", config=p.runner.config,
+        )
+        assert lease is not None and error is None
+    try:
+        assert await p.send(100) == 0
+        assert p.delivered == []
+    finally:
+        estop.disengage()
+        p.runner._external_drain_active = False
+        if lease is not None:
+            lease.release()
+
+    assert await p.send(100) == 1  # the rejected native ID was not charged/seen
+    assert await p.send(100) == 0
+    assert await p.send(101) == 0  # neither hop nor rate capacity was reopened
+
+
+def test_preflight_and_failed_retention_do_not_change_peer_budget(monkeypatch):
+    clock = SimpleNamespace(t=1000.0)
+    monkeypatch.setattr("gateway.bot_loop_guard.time.monotonic", lambda: clock.t)
+    guard = BotLoopGuard()
+    key = ("default", "telegram", "chat", "thread")
+    settings = {"max_hops": 1, "max_events": 1}
+    assert guard.admit(key, "1", True, settings, check_only=True)
+    assert guard._conversations == {}
+    assert not guard.admit(key, "1", True, settings, accept=lambda: False)
+
+    def failed_retention():
+        raise RuntimeError("queue unavailable")
+
+    with pytest.raises(RuntimeError, match="queue unavailable"):
+        guard.admit(key, "1", True, settings, accept=failed_retention)
+    assert guard._conversations == {}
+
+    def retained():
+        clock.t += 61  # rate accounting belongs to acceptance, not preflight
+        return True
+
+    assert guard.admit(key, "1", True, settings, accept=retained)
+    assert not guard.admit(key, "1", True, settings)
+    assert not guard.admit(key, "2", True, settings)
+    assert guard.admit(key, "2", False, settings)
+    assert not guard.admit(key, "3", True, settings)  # human resets hops, not the rate window

@@ -11,6 +11,7 @@ import pytest
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
 from gateway.run import GatewayRunner
+from gateway.run_busy import _BOT_ADMISSION_RECEIPT, _FIFO_HANDOFF_RECEIPT
 from gateway.session import SessionSource
 
 
@@ -80,18 +81,26 @@ def make_event(text, message_id, *, is_bot=False, **source_fields):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("mode", ["interrupt", "steer", "queue"])
 @pytest.mark.parametrize("with_media", [False, True])
-@pytest.mark.parametrize("ingress,peer_count", [("base", 2), ("priority", 2), ("priority", 6)])
-async def test_peer_waits_for_completed_response_before_its_own_turn(monkeypatch, tmp_path, mode, with_media, ingress, peer_count):
+@pytest.mark.parametrize("mode,ingress,peer_count,human_at", [
+    *((mode, ingress, count, None) for mode in ("interrupt", "steer", "queue")
+      for ingress, count in (("base", 2), ("priority", 2), ("priority", 6))),
+    ("queue", "base", 6, 3), ("queue", "priority", 6, 4),
+])
+async def test_peer_waits_for_completed_response_before_its_own_turn(
+    monkeypatch, tmp_path, mode, with_media, ingress, peer_count, human_at,
+):
     """Exercise Base.handle_message → runner busy FIFO → real turn drain/delivery."""
     import gateway.run as gateway_run
 
     adapter = CaptureAdapter()
     runner = make_runner(adapter, mode)
     adapter.config.extra["bot_loop"] = {"max_hops": peer_count, "max_events": peer_count}
-    if ingress == "priority":
-        prepare_priority_runner(runner, None)
+    prepare_priority_runner(runner, None)
+    runner._run_post_turn_hooks = AsyncMock()
+    runner._persist_active_agents = Mock()
+    runner._clear_durable_active_turn = AsyncMock()
+    monkeypatch.setenv("HERMES_GATEWAY_BUSY_ACK_ENABLED", "false")
     adapter.blocked_response = "answer-1"
     adapter.release_first_send.clear()
     monkeypatch.setenv("TELEGRAM_ALLOW_BOTS", "mentions")
@@ -130,7 +139,7 @@ async def test_peer_waits_for_completed_response_before_its_own_turn(monkeypatch
             else:
                 # The recursive drain is still busy: peer responses arriving
                 # during it cannot extend the already exhausted chain.
-                followup = make_event("loop continuation", str(102 + len(calls)), is_bot=True)
+                followup = make_event("loop continuation", str(102 + len(calls)) if human_at is None else "101", is_bot=True)
                 followup.allow_gateway_control = False
                 asyncio.run_coroutine_threadsafe(adapter.handle_message(followup), loop).result(5)
             answer = f"answer-{len(calls)}"
@@ -145,9 +154,7 @@ async def test_peer_waits_for_completed_response_before_its_own_turn(monkeypatch
     fake_agent_module.AIAgent = ControlledAgent
     monkeypatch.setitem(sys.modules, "run_agent", fake_agent_module)
 
-    async def handle(event):
-        if event.source.is_bot:
-            assert await runner._hm_admit_event(event) is not None
+    async def execute(event, source, session_key, generation):
         message = await runner._prepare_profile_scoped_inbound_message_text(
             event=event, source=event.source, history=[], session_key=key,
         )
@@ -157,7 +164,8 @@ async def test_peer_waits_for_completed_response_before_its_own_turn(monkeypatch
         )
         return result["final_response"]
 
-    adapter.set_message_handler(handle)
+    runner._handle_message_with_agent = execute
+    adapter.set_message_handler(runner._handle_message)
     await adapter.handle_message(human)
     task = adapter._session_tasks[key]
     peer = make_event("peer result", "101", is_bot=True)
@@ -180,8 +188,11 @@ async def test_peer_waits_for_completed_response_before_its_own_turn(monkeypatch
         queued.reply_to_message_id = str(80 + n)
         queued.reply_to_text = f"request-{n}"
         queued.channel_context = f"context-{n}"
+    if human_at is not None:
+        peers[human_at].source.is_bot = False
+        peers[human_at].source.user_id = "human"
     for queued in peers:
-        queued.allow_gateway_control = False
+        queued.allow_gateway_control = not queued.source.is_bot
     try:
         await asyncio.wait_for(started.wait(), 10)
         deliver = runner._handle_message if ingress == "priority" else adapter.handle_message
@@ -368,8 +379,10 @@ async def test_human_queue_media_cannot_cross_peer_barrier(monkeypatch, layout):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("depth_extra", [0, 1])
 @pytest.mark.parametrize("peer_first", [False, True])
-async def test_recursion_cap_restores_mixed_photo_head_without_losing_fifo(monkeypatch, depth_extra, peer_first):
+@pytest.mark.parametrize("rewrite", ["allow", "same", "changed"])
+async def test_recursion_cap_restores_mixed_photo_head_without_losing_fifo(monkeypatch, depth_extra, peer_first, rewrite):
     monkeypatch.setenv("TELEGRAM_ALLOW_BOTS", "mentions")
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "human")
     adapter = CaptureAdapter()
     runner = make_runner(adapter, "queue")
     runner._BUSY_QUEUE_MAX_PENDING = 3
@@ -401,10 +414,33 @@ async def test_recursion_cap_restores_mixed_photo_head_without_losing_fifo(monke
         assert event.reply_to_message_id == str(590 + n)
         assert event.reply_to_text == f"request-{n}"
         assert event.channel_context == f"context-{n}"
+    from hermes_cli import lifecycle
+    rewritten_text = "normalized peer" if rewrite == "changed" else pending_event.text
+    monkeypatch.setattr(lifecycle, "invoke_hook", lambda *a, **kw: [
+        {"action": "allow"} if rewrite == "allow" else {"action": "rewrite", "text": rewritten_text},
+    ])
+    assert await runner._hm_admit_event(pending_event) is None  # still queued, even for humans
+    assert adapter._pending_messages.pop(key) is pending_event
+    prepare_priority_runner(runner, None)
+    runner._handle_message_with_agent = AsyncMock(return_value="cold peer answer")
+    runner._run_post_turn_hooks = AsyncMock()
+    runner._persist_active_agents = Mock()
+    runner._clear_durable_active_turn = AsyncMock()
+    assert await runner._handle_message(pending_event) == "cold peer answer"
+    dispatched = runner._handle_message_with_agent.call_args.args[0]
+    assert dispatched.text == rewritten_text
+    assert (dispatched is pending_event) == (rewrite == "allow")
+    assert dispatched.message_id == pending_event.message_id
+    assert dispatched.reply_to_message_id == pending_event.reply_to_message_id
+    runner._handle_message_with_agent.assert_awaited_once()
     if peer_first:
-        assert adapter._pending_messages.pop(key) is pending_event
-        assert await runner._hm_admit_event(pending_event) is not None
-        assert await runner._hm_admit_event(pending_event) is None
+        assert await runner._handle_message(pending_event) is None
+        assert await runner._handle_message(dispatched) is None
+    else:
+        # A human head owns FIFO precedence only, never peer admission.
+        assert runner._trusted_queue_receipt(dispatched, _BOT_ADMISSION_RECEIPT) is None
+    assert runner._queue_depth(key, adapter=adapter) == len(events) - 1
+    assert runner._overflow_queue(key) == events[1:]
 
 
 def prepare_priority_runner(runner, agent):
@@ -470,6 +506,54 @@ async def test_priority_peer_ingress_obeys_shared_fifo_and_drain(monkeypatch, mo
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("ingress", ["base", "priority"])
+@pytest.mark.parametrize("storage", ["full", "unavailable"])
+async def test_full_busy_fifo_does_not_charge_rejected_peer(monkeypatch, ingress, storage):
+    from gateway.run import _AGENT_PENDING_SENTINEL
+
+    monkeypatch.setenv("TELEGRAM_ALLOW_BOTS", "mentions")
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "human")
+    adapter = CaptureAdapter()
+    runner = make_runner(adapter, "queue")
+    runner._BUSY_QUEUE_MAX_PENDING = 1
+    adapter.config.extra["bot_loop"] = {
+        "max_hops": 1, "max_events": 1, "window_seconds": 60,
+    }
+    key = prepare_priority_runner(runner, _AGENT_PENDING_SENTINEL)
+    blocker = make_event("human already queued", "700")
+    runner._queue_or_replace_pending_event(key, blocker)
+    if storage == "unavailable":
+        del adapter._pending_messages
+    peer = make_event("peer handoff", "701", is_bot=True)
+    peer.allow_gateway_control = False
+
+    if ingress == "base":
+        assert await runner._handle_active_session_busy_message(peer, key)
+    else:
+        await runner._handle_message(peer)
+    if storage == "unavailable":
+        adapter._pending_messages = {}
+    else:
+        assert adapter._pending_messages.pop(key) is blocker
+    replay = make_event("peer handoff", "701", is_bot=True)
+    replay.allow_gateway_control = False
+    if ingress == "base":
+        assert await runner._handle_active_session_busy_message(replay, key)
+    else:
+        await runner._handle_message(replay)
+    assert adapter._pending_messages[key] is replay
+    assert runner._trusted_queue_receipt(replay, _BOT_ADMISSION_RECEIPT) is not None
+
+    duplicate = make_event("duplicate", "701", is_bot=True)
+    duplicate.allow_gateway_control = False
+    if ingress == "base":
+        assert await runner._handle_active_session_busy_message(duplicate, key)
+    else:
+        await runner._handle_message(duplicate)
+    assert runner._queue_depth(key, adapter=adapter) == 1
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("restart,mode,accepted", [(False, "queue", False), (True, "interrupt", False),
                                                   (True, "queue", True), (True, "steer", True)])
 async def test_peer_busy_drain_honors_policy_without_ack(monkeypatch, restart, mode, accepted):
@@ -486,3 +570,80 @@ async def test_peer_busy_drain_honors_policy_without_ack(monkeypatch, restart, m
     if not accepted:
         runner._draining = False
         assert await runner._hm_admit_event(peer) is not None  # dropped input wasn't charged
+
+
+@pytest.mark.asyncio
+async def test_peer_receipt_is_event_bound_one_use_and_does_not_retain_canceled_work(monkeypatch):
+    import copy
+    import gc
+    import weakref
+    from hermes_cli import lifecycle
+
+    monkeypatch.setenv("TELEGRAM_ALLOW_BOTS", "mentions")
+    adapter = CaptureAdapter()
+    runner = make_runner(adapter, "queue")
+    peer = make_event("handoff", "800", is_bot=True)
+    key = runner._session_key_for_source(peer.source)
+    assert runner._queue_busy_peer_event(peer, key)
+    runner._issue_queue_receipt(peer, _FIFO_HANDOFF_RECEIPT)
+    clone = copy.copy(peer)  # even copying the dynamic opaque tokens grants no authority
+    assert not runner._consume_queue_receipt(clone, _FIFO_HANDOFF_RECEIPT)
+    assert await runner._hm_admit_event(clone) is None
+    assert await runner._hm_admit_event(peer) is None  # still queued
+    assert adapter._pending_messages.pop(key) is peer
+    reentrant = []
+
+    def rewrite(*args, **kwargs):
+        event = kwargs["event"]
+        # A hook sees no reusable admission token, even before its rewrite.
+        reentrant.append((runner._consume_queue_receipt(event, _BOT_ADMISSION_RECEIPT),
+                          runner._consume_queue_receipt(event, _FIFO_HANDOFF_RECEIPT)))
+        runner._queue_busy_peer_event(event, key)
+        return [{"action": "rewrite", "text": "normalized"}]
+
+    monkeypatch.setattr(lifecycle, "invoke_hook", rewrite)
+    admitted = await runner._hm_admit_event(peer)
+    assert admitted is not None and admitted[3:] == (True, True)
+    assert reentrant == [(False, False)]
+    assert runner._queue_depth(key, adapter=adapter) == 0
+    assert await runner._hm_admit_event(admitted[0]) is None
+    assert await runner._hm_admit_event(peer) is None
+
+    canceled = make_event("canceled", "801", is_bot=True)
+    assert runner._queue_busy_peer_event(canceled, key)
+    runner._issue_queue_receipt(canceled, _FIFO_HANDOFF_RECEIPT)
+    reference = weakref.ref(canceled)
+    adapter._pending_messages.clear()  # /stop or reset can drop a queued event
+    del canceled
+    gc.collect()
+    assert reference() is None
+    assert not runner._queued_event_receipts
+
+    adapter.config.extra["bot_loop"] = {"max_hops": 2}
+    uncharged = make_event("precedence is not admission", "802", is_bot=True)
+    runner._issue_queue_receipt(uncharged, _FIFO_HANDOFF_RECEIPT)
+    # Moving a valid precedence token onto the budget attribute cannot upgrade it.
+    uncharged.__dict__[_BOT_ADMISSION_RECEIPT] = uncharged.__dict__[_FIFO_HANDOFF_RECEIPT]
+    assert await runner._hm_admit_event(uncharged) is None
+    assert not runner._queued_event_receipts
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("policy", ["unauthorized", "skip", "command"])
+async def test_peer_receipt_cannot_bypass_current_policy(monkeypatch, policy):
+    from hermes_cli import lifecycle
+
+    monkeypatch.setenv("TELEGRAM_ALLOW_BOTS", "mentions")
+    adapter = CaptureAdapter()
+    runner = make_runner(adapter, "queue")
+    peer = make_event("handoff", "900", is_bot=True)
+    key = runner._session_key_for_source(peer.source)
+    assert runner._queue_busy_peer_event(peer, key)
+    assert adapter._pending_messages.pop(key) is peer
+    if policy == "unauthorized":
+        monkeypatch.setenv("TELEGRAM_ALLOW_BOTS", "none")
+    else:
+        result = {"action": "skip"} if policy == "skip" else {"action": "rewrite", "text": "/stop"}
+        monkeypatch.setattr(lifecycle, "invoke_hook", lambda *a, **kw: [result])
+    assert await runner._hm_admit_event(peer) is None
+    assert not runner._queued_event_receipts

@@ -3395,6 +3395,7 @@ class GatewayTurnMixin:
     ) -> Any:
         """Run the queued / interrupting follow-up as the next turn (recursive ``_run_agent``)."""
         from gateway.run import _preserve_queued_followup_history_offset
+        from gateway.run_busy import _BOT_ADMISSION_RECEIPT, _FIFO_HANDOFF_RECEIPT
         source, session_id, session_key, run_generation = (
             turn_ctx.source, turn_ctx.session_id, turn_ctx.session_key, turn_ctx.run_generation,
         )
@@ -3424,6 +3425,7 @@ class GatewayTurnMixin:
                 if promoted is not None:
                     overflow.insert(0, promoted)
                 adapter._pending_messages[session_key] = pending_event
+                self._issue_queue_receipt(pending_event, _FIFO_HANDOFF_RECEIPT)
                 if len(overflow) >= self._BUSY_QUEUE_MAX_PENDING:
                     logger.warning("Dropping newest busy follow-up while restoring capped FIFO for %s", session_key)
                     del overflow[self._BUSY_QUEUE_MAX_PENDING - 1:]
@@ -3441,9 +3443,10 @@ class GatewayTurnMixin:
         next_message_id = next_channel_prompt = next_message_type = None
         # See #60671.
         if pending_event is not None:
-            # Recursive dispatch consumes the same one-use receipt as cold ingress;
-            # the cap fallback above deliberately leaves it intact for Base's task.
-            pending_event.__dict__.pop("_hermes_bot_budget_admitted", None)
+            # Recursive dispatch consumes the same runner-owned, one-use receipt
+            # as cold ingress; the cap fallback leaves it intact for Base's task.
+            self._consume_queue_receipt(pending_event, _BOT_ADMISSION_RECEIPT)
+            self._consume_queue_receipt(pending_event, _FIFO_HANDOFF_RECEIPT)
             next_source = getattr(pending_event, "source", None) or source
             if self._is_goal_continuation_event(pending_event) and not self._goal_still_active_for_session(session_id):
                 logger.info(

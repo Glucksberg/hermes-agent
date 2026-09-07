@@ -14,6 +14,7 @@ import contextlib
 import json
 import os
 import time
+from weakref import WeakValueDictionary
 from agent.i18n import t
 from gateway.config import Platform
 from gateway.platforms.base import EphemeralReply, MessageEvent, MessageType
@@ -26,6 +27,10 @@ if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
+
+# Separate authorities: charging a peer and preserving a capped FIFO head.
+_BOT_ADMISSION_RECEIPT = "_hermes_bot_budget_admitted"
+_FIFO_HANDOFF_RECEIPT = "_hermes_fifo_handoff"
 
 
 class GatewayBusySessionMixin:
@@ -41,15 +46,16 @@ class GatewayBusySessionMixin:
         state = self._peek_session_state(session_key)
         return state.conversation.queued_events if state else None
 
-    def _enqueue_fifo(self, session_key: str, queued_event: "MessageEvent", adapter: Any) -> None:
+    def _enqueue_fifo(self, session_key: str, queued_event: "MessageEvent", adapter: Any) -> bool:
         """Append a /queue event to the FIFO chain for a session."""
         pending_slot = getattr(adapter, "_pending_messages", None) if adapter is not None else None
         if pending_slot is None:
-            return
+            return False
         if session_key in pending_slot:
             self._session_state(session_key).conversation.queued_events.append(queued_event)
         else:
             pending_slot[session_key] = queued_event
+        return True
 
     def _promote_queued_event(
         self, session_key: str, adapter: Any, pending_event: Optional["MessageEvent"]
@@ -283,11 +289,12 @@ class GatewayBusySessionMixin:
             and getattr(source, "is_bot", False) is True
         )
 
-    def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> None:
+    def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> bool:
+        """Queue *event* and report whether it was actually retained."""
         from gateway.platforms.base import merge_pending_message_event
         adapter = self._adapter_for_source(event.source)
         if not adapter:
-            return
+            return False
         # FIFO so each follow-up gets its own turn in arrival order (the single pending slot used to
         # be silently OVERWRITTEN). Photo bursts still merge into the head slot (album semantics).
         pending_slot = getattr(adapter, "_pending_messages", None)
@@ -322,16 +329,16 @@ class GatewayBusySessionMixin:
                 adapter._pending_messages, session_key, event,
                 merge_text=event.message_type == MessageType.TEXT,
             )
-            return
+            return True
 
         if self._queue_depth(session_key, adapter=adapter) >= self._BUSY_QUEUE_MAX_PENDING:
             logger.warning(
                 "Dropping busy-mode follow-up for session %s — pending queue at cap (%d).",
                 session_key, self._BUSY_QUEUE_MAX_PENDING,
             )
-            return
+            return False
 
-        self._enqueue_fifo(session_key, event, adapter)
+        return self._enqueue_fifo(session_key, event, adapter)
 
     async def _prepare_busy_steer_text(self, event: MessageEvent) -> str:
         """Steerable text for a busy follow-up, transcribing voice-message media first.
@@ -614,24 +621,50 @@ class GatewayBusySessionMixin:
         except Exception as e:
             logger.debug("Failed to send busy-ack: %s", e)
 
-    def _queue_busy_peer_event(
-        self, event: MessageEvent, session_key: str, *, pre_admitted: bool = False
-    ) -> bool:
-        """Consume native peer work before any human control/photo shortcuts.
+    def _trusted_queue_receipt(self, event: MessageEvent, receipt_name: str):
+        """Return a receipt only for its original event and authority kind."""
+        token = event.__dict__.get(receipt_name)
+        receipts = getattr(self, "_queued_event_receipts", None)
+        try:
+            return token if receipts is not None and receipts.get((receipt_name, token)) is event else None
+        except TypeError:  # an untrusted, unhashable dynamic attribute
+            return None
 
-        Only the runner's cold ingress may pass pre_admitted; Base deliveries must
-        always recheck budget/dedupe, even when redelivering the same event object.
-        """
+    def _issue_queue_receipt(self, event: MessageEvent, receipt_name: str) -> None:
+        if self._trusted_queue_receipt(event, receipt_name) is not None:
+            return
+        token = object()
+        receipts = getattr(self, "_queued_event_receipts", None)
+        if receipts is None:
+            receipts = self._queued_event_receipts = WeakValueDictionary()
+        receipts[(receipt_name, token)] = event
+        event.__dict__[receipt_name] = token
+
+    def _consume_queue_receipt(self, event: MessageEvent, receipt_name: str) -> bool:
+        token = self._trusted_queue_receipt(event, receipt_name)
+        if token is None:
+            event.__dict__.pop(receipt_name, None)
+            return False
+        self._queued_event_receipts.pop((receipt_name, token), None)
+        event.__dict__.pop(receipt_name, None)
+        return True
+
+    def _queue_busy_peer_event(self, event: MessageEvent, session_key: str) -> bool:
+        """Consume native peer work before any human control/photo shortcuts."""
         if not self._is_telegram_peer_event(event):
             return False
         if self._draining and not self._queue_during_drain_enabled(
             self._effective_busy_input_mode(event.source)
         ):
             return True
+
+        # Busy ingress always checks dedupe, even for the exact queued object.
+        # Only cold ingress may consume a receipt after the event leaves FIFO.
         from gateway.bot_loop_guard import admit_telegram_bot_turn
-        if pre_admitted or admit_telegram_bot_turn(self, event):
-            event.__dict__["_hermes_bot_budget_admitted"] = True
-            self._queue_or_replace_pending_event(session_key, event)
+        if admit_telegram_bot_turn(
+            self, event, accept=lambda: self._queue_or_replace_pending_event(session_key, event)
+        ):
+            self._issue_queue_receipt(event, _BOT_ADMISSION_RECEIPT)
         return True
 
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
