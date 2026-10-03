@@ -1613,6 +1613,7 @@ class GatewayShutdownMixin:
         )
         return (
             max(0, non_cron - self._wedged_chat_agent_count())
+            + self._active_async_delegation_count()
             + self._restart_wait_cron_counts()["awaitable"]
         )
 
