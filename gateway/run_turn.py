@@ -1143,9 +1143,8 @@ class GatewayTurnMixin:
         if _hyg_rotated or _hyg_in_place:
             # Persisted (rotation) or persisted by archive_and_compact() (in-place): reset token count.
             session_entry.last_prompt_tokens = 0
-            attempt.history = _compressed
-            _new_count = len(_compressed)
-            _new_tokens = estimate_messages_tokens_rough(_compressed)
+            attempt.history = await self._reload_hygiene_history(session_entry.session_id, _compressed)
+            _new_count, _new_tokens = len(_compressed), estimate_messages_tokens_rough(_compressed)
         else:
             # No rewrite happened — post-compression counts equal the pre-compression ones.
             _new_count = plan.msg_count
@@ -2200,7 +2199,7 @@ class GatewayTurnMixin:
                 run_generation=run_generation, event_message_id=self._reply_anchor_for_event(event),
                 inbound_message_id=str(event.message_id) if event.message_id else None,
                 channel_prompt=_turn_channel_prompt, moa_config=getattr(event, "_moa_config", None),
-                title_user_message=prepared.title_user_message,
+                observed_audio_event=event, title_user_message=prepared.title_user_message,
                 persist_user_message=prepared.persist_user_message,
                 persist_user_timestamp=prepared.persist_user_timestamp,
                 persist_user_display_kind=prepared.persist_user_display_kind,
@@ -3940,7 +3939,7 @@ class GatewayTurnMixin:
                 source=next_source, session_id=session_id, session_key=next_session_key,
                 run_generation=run_generation, _interrupt_depth=_interrupt_depth + 1,
                 event_message_id=next_message_id, inbound_message_id=next_inbound_id,
-                channel_prompt=next_channel_prompt, message_type=next_message_type,
+                channel_prompt=next_channel_prompt, message_type=next_message_type, observed_audio_event=pending_event,
                 persist_user_message=next_persist_message,
                 persist_user_display_kind=next_display_kind,
                 reply_expected=next_reply_expected,
@@ -4267,7 +4266,7 @@ class GatewayTurnMixin:
         source: SessionSource, session_id: str, session_key: str | None = None,
         run_generation: Optional[int] = None, _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None, inbound_message_id: Optional[str] = None,
-        channel_prompt: Optional[str] = None, moa_config: Optional[dict] = None,
+        channel_prompt: Optional[str] = None, moa_config: Optional[dict] = None, observed_audio_event: Any = None,
         persist_user_message: Optional[Any] = None, persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None, message_type: Optional[str] = None,
         persist_user_display_metadata: Optional[dict] = None,
@@ -4300,10 +4299,11 @@ class GatewayTurnMixin:
                 _native_slack_task_cards=False,
                 needs_progress_queue=False,
             )
+        history, observed_audio_transcripts = await self._observed_audio_turn_inputs(history, channel_prompt=channel_prompt, message=message, event=observed_audio_event)
         turn_ctx, turn_runner, _cleanup_adapter = self._run_agent_build_turn_context(
             disp, AIAgent, message=message, source=source, session_key=session_key,
             run_generation=run_generation, context_prompt=context_prompt, history=history,
-            session_id=session_id, _interrupt_depth=_interrupt_depth,
+            session_id=session_id, _interrupt_depth=_interrupt_depth, observed_audio_transcripts=observed_audio_transcripts,
             event_message_id=event_message_id, inbound_message_id=inbound_message_id,
             channel_prompt=channel_prompt, moa_config=moa_config,
             title_user_message=title_user_message,

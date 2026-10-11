@@ -243,10 +243,8 @@ def test_observed_group_context_uses_shared_source_and_prompt_for_later_mentions
 
 
 def test_observed_group_context_replays_as_current_message_context_not_user_turns():
-    from gateway.run import (
-        _build_gateway_agent_history,
-        _wrap_current_message_with_observed_context,
-    )
+    from gateway.run import _build_gateway_agent_history
+    from gateway.run_observed_audio import _wrap_current_message_with_observed_context
 
     history = [
         {"role": "session_meta", "content": "tool defs"},
@@ -274,10 +272,8 @@ def test_observed_group_context_replays_as_current_message_context_not_user_turn
 
 def test_observed_group_context_does_not_hide_current_user_turn_behind_history_offset():
     from agent.agent_runtime_helpers import repair_message_sequence
-    from gateway.run import (
-        _build_gateway_agent_history,
-        _wrap_current_message_with_observed_context,
-    )
+    from gateway.run import _build_gateway_agent_history
+    from gateway.run_observed_audio import _wrap_current_message_with_observed_context
 
     history = [
         {"role": "user", "content": "[Alice|111]\nAcha que dá fazer estoque?", "observed": True},
@@ -299,7 +295,7 @@ def test_observed_group_context_does_not_hide_current_user_turn_behind_history_o
 
 
 def test_observed_group_context_wraps_multimodal_current_message_without_mutating_parts():
-    from gateway.run import _wrap_current_message_with_observed_context
+    from gateway.run_observed_audio import _wrap_current_message_with_observed_context
 
     original = [
         {"type": "text", "text": "[Bob|222]\nsee this image"},
@@ -318,7 +314,7 @@ def test_observed_group_context_wraps_multimodal_current_message_without_mutatin
 
 
 def test_observed_group_context_marks_observed_audio_transcript_as_available():
-    from gateway.run import _wrap_current_message_with_observed_context
+    from gateway.run_observed_audio import _wrap_current_message_with_observed_context
 
     wrapped = _wrap_current_message_with_observed_context(
         "[Bob|222]\nconsegue acessar esse audio que estou respondendo?",
@@ -340,7 +336,7 @@ def test_observed_group_context_marks_observed_audio_transcript_as_available():
 
 
 def test_observed_audio_transcript_turn_persists_like_voice_message():
-    from gateway.run import _should_persist_clean_observed_message
+    from gateway.run_observed_audio import _should_persist_clean_observed_message
 
     assert _should_persist_clean_observed_message("[Alice]\nside chatter", None) is True
     assert _should_persist_clean_observed_message("[Alice]\nside chatter", []) is True

@@ -158,7 +158,7 @@ async def test_observed_audio_context_transcribes_on_addressed_followup(tmp_path
         {"role": "assistant", "content": "previous reply"},
     ]
 
-    with patch("gateway.run._resolve_observed_audio_cache_path", return_value=str(audio_path.resolve())), patch(
+    with patch("gateway.run_observed_audio._resolve_observed_audio_cache_path", return_value=str(audio_path.resolve())), patch(
         "tools.transcription_tools.transcribe_audio",
         return_value={
             "success": True,
@@ -172,7 +172,7 @@ async def test_observed_audio_context_transcribes_on_addressed_followup(tmp_path
             current_message="[Bob|222]\nconsegue acessar esse audio?",
         )
 
-    transcribe.assert_called_once_with(str(audio_path.resolve()))
+    transcribe.assert_called_once_with(str(audio_path.resolve()), None, "gateway")
     assert enriched[0] is not history[0]
     assert "Observed audio transcript" in enriched[0]["content"]
     assert "observed voice transcript" in enriched[0]["content"]
@@ -184,7 +184,7 @@ async def test_observed_audio_context_transcribes_on_addressed_followup(tmp_path
 async def test_observed_audio_transcript_cache_is_bounded_lru_and_stat_sensitive(
     tmp_path, monkeypatch
 ):
-    import gateway.run as gateway_run
+    import gateway.run_observed_audio as gateway_run
     from gateway.run import GatewayRunner
 
     monkeypatch.setattr(gateway_run, "_OBSERVED_AUDIO_TRANSCRIPT_CACHE_MAX_SIZE", 3)
@@ -210,7 +210,7 @@ async def test_observed_audio_transcript_cache_is_bounded_lru_and_stat_sensitive
 
     calls = []
 
-    def transcribe(path):
+    def transcribe(path, model=None, source=None):
         calls.append(path)
         return {
             "success": True,
@@ -219,7 +219,7 @@ async def test_observed_audio_transcript_cache_is_bounded_lru_and_stat_sensitive
         }
 
     with patch(
-        "gateway.run._resolve_observed_audio_cache_path",
+        "gateway.run_observed_audio._resolve_observed_audio_cache_path",
         side_effect=lambda path: str(Path(path).resolve()),
     ), patch("tools.transcription_tools.transcribe_audio", side_effect=transcribe):
         for audio_path in audio_paths[:3]:
@@ -280,7 +280,7 @@ async def test_observed_audio_context_transcribes_only_latest_audio_for_clear_re
         str(newer_audio): str(newer_audio.resolve()),
     }
     with patch(
-        "gateway.run._resolve_observed_audio_cache_path",
+        "gateway.run_observed_audio._resolve_observed_audio_cache_path",
         side_effect=resolved_paths.get,
     ), patch(
         "tools.transcription_tools.transcribe_audio",
@@ -292,7 +292,7 @@ async def test_observed_audio_context_transcribes_only_latest_audio_for_clear_re
             current_message="[Bob|222]\ntranscreva o último áudio, por favor",
         )
 
-    transcribe.assert_called_once_with(str(newer_audio.resolve()))
+    transcribe.assert_called_once_with(str(newer_audio.resolve()), None, "gateway")
     assert enriched[0] is history[0]
     assert "Observed audio transcript" not in enriched[0]["content"]
     assert "latest voice" in enriched[1]["content"]
@@ -325,7 +325,7 @@ async def test_observed_audio_context_uses_explicit_reference_before_latest_audi
     ]
 
     with patch(
-        "gateway.run._resolve_observed_audio_cache_path",
+        "gateway.run_observed_audio._resolve_observed_audio_cache_path",
         side_effect=lambda path: str(Path(path).resolve()),
     ), patch(
         "tools.transcription_tools.transcribe_audio",
@@ -338,7 +338,7 @@ async def test_observed_audio_context_uses_explicit_reference_before_latest_audi
             explicit_audio_reference=f"[audio 'older.ogg' saved at: {older_audio}]",
         )
 
-    transcribe.assert_called_once_with(str(older_audio.resolve()))
+    transcribe.assert_called_once_with(str(older_audio.resolve()), None, "gateway")
     assert "older voice" in enriched[0]["content"]
     assert enriched[1] is history[1]
 
@@ -424,7 +424,7 @@ async def test_observed_audio_context_ignores_audio_before_last_addressed_turn(t
 
 
 def test_observed_audio_transcripts_from_history_only_returns_current_selection():
-    from gateway.run import _observed_audio_transcripts_from_history
+    from gateway.run_observed_audio import _observed_audio_transcripts_from_history
 
     transcripts = _observed_audio_transcripts_from_history(
         [
@@ -439,7 +439,8 @@ def test_observed_audio_transcripts_from_history_only_returns_current_selection(
 @pytest.mark.asyncio
 async def test_observed_audio_context_clears_prior_turn_marker_without_audio_request(tmp_path):
     """Queued follow-ups must not re-inject a transcript selected by the prior turn."""
-    from gateway.run import GatewayRunner, _observed_audio_transcripts_from_history
+    from gateway.run import GatewayRunner
+    from gateway.run_observed_audio import _observed_audio_transcripts_from_history
 
     audio_path = tmp_path / "prior.ogg"
     audio_path.write_bytes(b"prior ogg bytes")
@@ -546,7 +547,7 @@ async def test_observed_audio_context_waits_for_audio_request(tmp_path):
 
 
 def test_observed_audio_cache_path_resolves_agent_visible_docker_path(tmp_path):
-    from gateway.run import _resolve_observed_audio_cache_path
+    from gateway.run_observed_audio import _resolve_observed_audio_cache_path
 
     host_audio_dir = tmp_path / "cache" / "audio"
     host_audio_dir.mkdir(parents=True)

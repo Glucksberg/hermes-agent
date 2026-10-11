@@ -6,10 +6,16 @@ reader of the compressor's ``_last_compaction_in_place`` flag on the hygiene rou
 
 import logging
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
+from gateway.run_observed_audio import GatewayObservedAudioMixin
 from gateway.run_turn import GatewayTurnMixin
+
+
+class _Runner(GatewayTurnMixin, GatewayObservedAudioMixin):
+    """The adopt step plus the post-adoption transcript reload it ends with."""
 
 _HISTORY = [{"role": "user", "content": "x" * 400}, {"role": "assistant", "content": "y" * 400}] * 4
 _COMPRESSED = [{"role": "user", "content": "summary"}, {"role": "assistant", "content": "ok"}]
@@ -33,7 +39,9 @@ def _agent(**signals):
 
 async def _adopt(agent, caplog):
     """Run the gateway adopt step for an unrotated hygiene attempt; returns (attempt, entry, result)."""
-    runner = GatewayTurnMixin.__new__(GatewayTurnMixin)
+    runner = _Runner.__new__(_Runner)
+    # A landed compaction is already persisted, so the reload reads back the compressed rows.
+    runner.async_session_store = SimpleNamespace(load_transcript=AsyncMock(return_value=_COMPRESSED))
     attempt = SimpleNamespace(agent=agent, history=_HISTORY)
     plan = SimpleNamespace(msg_count=len(_HISTORY), approx_tokens=4_000, warn_token_threshold=10**9)
     entry = SimpleNamespace(session_id="sid-1", last_prompt_tokens=4_000)

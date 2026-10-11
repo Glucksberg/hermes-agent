@@ -1250,7 +1250,10 @@ async def test_hygiene_miss_bounds_the_model_payload(monkeypatch, tmp_path):
         runner2, _adapter2, event2 = _make_cooldown_runner(
             monkeypatch, tmp_path, _LandedCompressAgent, db, "sess-landed"
         )
-        runner2.session_store.load_transcript.return_value = _make_bound_probe_transcript()
+        # The landed rotation is persisted under the child id: the post-adoption reload reads it back.
+        runner2.session_store.load_transcript.side_effect = lambda sid: (
+            _LandedCompressAgent.last_compressed if sid.endswith("_compressed") else _make_bound_probe_transcript()
+        )
         assert await asyncio.wait_for(runner2._handle_message(event2), timeout=15) == "ok"
         assert _turn_payload(runner2) is _LandedCompressAgent.last_compressed
     finally:
