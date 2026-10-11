@@ -679,9 +679,9 @@ def _merge_consecutive_users(messages: list[dict]) -> tuple[list[dict], int]:
             # A summary carrier followed by a new user row is a deliberate durable shape after
             # retry/rewind; never mutate the persisted carrier (sanitizers merge copies later).
             and split_user_originated_turn(prev)[0] is None
-            # A /steer row that ended the previous run is already persisted; merging the next
-            # prompt into it would rewrite it in place and re-break replay parity.
-            and prev.get("display_kind") != STEER_DISPLAY_KIND
+            # Persisted rows are never folded: a /steer row that ended the previous run (a merge rewrites it in place and
+            # re-breaks replay parity) and observed group context (a merge keeps only the first platform message id).
+            and prev.get("display_kind") != STEER_DISPLAY_KIND and not (prev.get("observed") or msg.get("observed"))
             # Only merge plain-text content; leave multimodal (list or undecodable sentinel) content alone.
             and _plain_text(prev.get("content", "")) and _plain_text(msg.get("content", ""))
         ):

@@ -946,7 +946,7 @@ class SessionMessagesMixin:
         covered_set = set(covered)
         carried_ids = self._resolve_carried_row_ids(conn, session_id, carried_messages or [])
         covered_set.update(carried_ids)
-        unseen = [row_id for row_id in active_ids if row_id not in covered_set]
+        unseen = self._drop_observed_beyond_cap(conn, [row_id for row_id in active_ids if row_id not in covered_set])
         covered_active = [row_id for row_id in active_ids if row_id in covered_set]
         rewind_ids = list(carried_ids)
         if tail_count > 0:
@@ -1029,6 +1029,7 @@ class SessionMessagesMixin:
                     conn, session_id, compacted_messages, proved[0], tail_count=tail_count,
                     carried_messages=carried_messages, patched_model_config=patched_model_config, patch=patch,
                     merged_away=proved[1])
+            live_messages = self._with_retained_observed(conn, session_id, compacted_messages, watermark)
             tail_ids, tail_tool_calls = ([], 0) if watermark is None else self._tail_rows_after_watermark(
                 conn, "SELECT id, tool_calls FROM messages WHERE session_id = ? AND active = 1 AND id > ? ORDER BY id",
                 (session_id, int(watermark)))
@@ -1055,8 +1056,8 @@ class SessionMessagesMixin:
             # Same identity carry as publish_compression_child (#59661): carried tail copies keep the
             # durable row's timestamp so display dedupe still collapses generations. Donors are active-only;
             # the rewound/archived originals above never donate, so this is a no-op for a clean compaction.
-            self._carry_parent_timestamps(conn, session_id, compacted_messages)
-            inserted, tool_calls_total = self._insert_message_rows(conn, session_id, compacted_messages)
+            self._carry_parent_timestamps(conn, session_id, live_messages)
+            inserted, tool_calls_total = self._insert_message_rows(conn, session_id, live_messages)
             if tail_ids:
                 self._clone_message_rows(conn, tail_ids)
                 inserted += len(tail_ids)

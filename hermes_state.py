@@ -68,6 +68,7 @@ from hermes_state_dbfile import (
 from hermes_state_messages import SessionMessagesMixin
 from hermes_state_coverage import SessionCoverageMixin
 from hermes_state_rewind import SessionRewindMixin
+from hermes_state_observed import SessionObservedMixin
 from hermes_state_wal import (
     _WAL_INCOMPAT_MARKERS, _on_disk_journal_mode, apply_database_pragmas, apply_wal_with_fallback,
 )
@@ -420,6 +421,10 @@ _repair_attempt_lock = threading.Lock()
 # only); sized for the slowest legitimate holder (VACUUM, multi-GB DB).
 _REPAIR_LOCK_TIMEOUT_SECONDS = 120.0
 _IS_WINDOWS = sys.platform == "win32"
+# Observed gateway messages bypass model-generated compression summaries, so retaining them without a
+# bound can rebuild an oversized live context after compaction: one global cap for the in-place and
+# split-session flows (hermes_state_observed.py).
+MAX_OBSERVED_CONTEXT_MESSAGES = 50
 
 
 def _close_time_checkpoint_configurable() -> bool:
@@ -463,6 +468,7 @@ class SessionDB(
     SessionPortabilityMixin, SessionTelegramTopicsMixin, SessionCompressionMixin,
     SessionGatewayMixin, SessionMaintenanceMixin, SessionUsageMixin, SessionTitlesMixin,
     SessionMessagesMixin, SessionCoverageMixin, SessionRewindMixin, SessionProfileRepairMixin, SessionToolRetriesMixin,
+    SessionObservedMixin,
 ):
     """SQLite-backed session storage with FTS5 search; many reader threads, one writer (WAL)."""
 

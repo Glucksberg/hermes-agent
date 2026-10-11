@@ -640,9 +640,13 @@ class SessionTranscriptMixin:
             db = self._db_for_session_id(session_id)
             session_id = db.get_compression_tip(session_id) or session_id
         try:
-            # repair_alternation: this feeds LIVE REPLAY; heal a durable user;user wedge once here.
-            return self._db_for_session_id(session_id).get_messages_as_conversation(
-                session_id, repair_alternation=True)
+            db = self._db_for_session_id(session_id)
+            # repair_alternation: this feeds LIVE REPLAY; heal a durable user;user wedge once here
+            # (observed rows are never merged). A compression split strands the parents' observed rows
+            # (unaddressed group media) under the old ids, so they are prefixed or the context vanishes.
+            messages = db.get_messages_as_conversation(session_id, repair_alternation=True)
+            ancestor_observed = getattr(db, "get_ancestor_observed_messages", None)
+            return [*ancestor_observed(session_id), *messages] if ancestor_observed else messages
         except Exception as e:
             # Empty history is valid data; a failed canonical read is not — live-replay callers
             # must fail closed, not start from [].
