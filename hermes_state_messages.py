@@ -946,7 +946,7 @@ class SessionMessagesMixin:
         covered_set = set(covered)
         carried_ids = self._resolve_carried_row_ids(conn, session_id, carried_messages or [])
         covered_set.update(carried_ids)
-        unseen = self._drop_observed_beyond_cap(conn, [row_id for row_id in active_ids if row_id not in covered_set])
+        unseen = self._bound_unseen_observed(conn, session_id, [row_id for row_id in active_ids if row_id not in covered_set])
         covered_active = [row_id for row_id in active_ids if row_id in covered_set]
         rewind_ids = list(carried_ids)
         if tail_count > 0:

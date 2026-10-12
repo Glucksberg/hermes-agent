@@ -1,9 +1,11 @@
 """Observed gateway rows (unaddressed group chatter) across in-place compaction are bounded.
 
 Observed rows never reach the compressor's summary, so the live set keeps at most
-``MAX_OBSERVED_CONTEXT_MESSAGES`` of them (the newest) whichever commit path runs: the
-watermark path re-inserts them ahead of the compacted set, the proved-coverage path clones the
-ones the compressor never held after it. Either way each survivor is live exactly once.
+``MAX_OBSERVED_CONTEXT_MESSAGES`` of them (the newest, and only those after the last addressed turn)
+whichever commit path runs: the watermark path re-inserts them after the compacted set, the
+proved-coverage path clones the ones the compressor never held after it. Either way each survivor is
+live exactly once. (Which rows survive and where they land is pinned against the prompt in
+tests/gateway/test_observed_context_window.py.)
 """
 
 from __future__ import annotations
@@ -43,15 +45,15 @@ def _observed_contents(messages: list[dict]) -> list[str]:
 EXPECTED_NEWEST = [f"observed-{index:03d}" for index in range(5, OVER_CAP)]
 
 
-def test_watermark_path_keeps_newest_observed_ahead_of_the_compacted_set(db: SessionDB) -> None:
-    _seed_observed(db)
+def test_watermark_path_keeps_newest_observed_after_the_compacted_set(db: SessionDB) -> None:
     db.append_message("sess1", role="user", content="ordinary turn")
+    _seed_observed(db)
 
     count = db.archive_and_compact("sess1", SUMMARY, watermark=db.get_active_message_watermark("sess1"))
 
     live = _live(db)
     assert _observed_contents(live) == EXPECTED_NEWEST
-    assert [message["content"] for message in live[-1:]] == ["compacted summary"]
+    assert live[0]["content"] == "compacted summary", "observed rows follow the compacted set, not lead it"
     assert count == len(live) == MAX_OBSERVED_CONTEXT_MESSAGES + 1
 
 
@@ -68,11 +70,11 @@ def test_watermark_path_clones_observed_rows_that_arrive_mid_compression_once(db
 
 
 def test_proved_coverage_path_caps_the_observed_rows_it_clones(db: SessionDB) -> None:
-    _seed_observed(db)
     ordinary = [
         db.append_message("sess1", role="user", content="ordinary question"),
         db.append_message("sess1", role="assistant", content="ordinary answer"),
     ]
+    _seed_observed(db)
 
     db.archive_and_compact("sess1", SUMMARY, covered_ids=ordinary)
 
@@ -83,8 +85,8 @@ def test_proved_coverage_path_caps_the_observed_rows_it_clones(db: SessionDB) ->
 
 
 def test_proved_coverage_path_leaves_a_small_observed_set_untouched(db: SessionDB) -> None:
-    _seed_observed(db, 3)
     ordinary = [db.append_message("sess1", role="user", content="ordinary question")]
+    _seed_observed(db, 3)
 
     db.archive_and_compact("sess1", SUMMARY, covered_ids=ordinary)
 

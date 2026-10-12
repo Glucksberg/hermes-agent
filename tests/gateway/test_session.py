@@ -363,7 +363,7 @@ class TestLoadTranscriptDBOnly:
 
         assert result == [{"role": "user", "content": "db-q"}]
 
-    def test_load_transcript_prepends_observed_compression_ancestors(self, tmp_path, monkeypatch):
+    def test_load_transcript_splices_observed_compression_ancestors_after_the_handoff(self, tmp_path, monkeypatch):
         import hermes_state
         monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
         config = GatewayConfig()
@@ -375,33 +375,71 @@ class TestLoadTranscriptDBOnly:
         store._db.append_message(
             session_id=parent,
             role="user",
+            content="ordinary parent turn",
+            observed=False,
+        )
+        # Observed after the last addressed turn: still inside the window, so it must survive the split.
+        store._db.append_message(
+            session_id=parent,
+            role="user",
             content="[Alice|111]\n[audio 'voice.ogg' saved at: /tmp/audio.ogg]",
             observed=True,
             platform_message_id="tg-1",
         )
-        store._db.append_message(
-            session_id=parent,
-            role="user",
-            content="ordinary parent turn",
-            observed=False,
-        )
-        store._db.end_session(parent, "compression")
-        store._db.create_session(
-            session_id=child,
-            source="gateway",
-            model="m",
+        store._db.publish_compression_child(
             parent_session_id=parent,
+            child_session_id=child,
+            source="gateway",
+            messages=[{"role": "assistant", "content": "compressed handoff"}],
+            require_compression_lease=False,
         )
-        store._db.append_message(session_id=child, role="user", content="current child turn")
 
         result = store.load_transcript(child)
 
+        # Order was inverted from the original (observed first, child last): carried observed rows now
+        # FOLLOW the handoff, so they stay after the last addressed turn the handoff ends with.
         assert [msg["content"] for msg in result] == [
+            "compressed handoff",
             "[Alice|111]\n[audio 'voice.ogg' saved at: /tmp/audio.ogg]",
-            "current child turn",
         ]
-        assert result[0]["observed"] is True
-        assert result[0]["message_id"] == "tg-1"
+        assert result[1]["observed"] is True
+        assert result[1]["message_id"] == "tg-1"
+
+    def test_load_transcript_spends_ancestor_observed_rows_on_an_addressed_parent_turn(self, tmp_path, monkeypatch):
+        import hermes_state
+        monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
+        store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+        parent = "spent_parent"
+        child = "spent_child"
+        store._db.create_session(session_id=parent, source="gateway", model="m")
+        # Observed BEFORE an addressed turn: already consumed by it, so it must not come back.
+        store._db.append_message(session_id=parent, role="user", content="old chatter", observed=True)
+        store._db.append_message(session_id=parent, role="user", content="addressed parent turn")
+        store._db.publish_compression_child(
+            parent_session_id=parent, child_session_id=child, source="gateway",
+            messages=[{"role": "assistant", "content": "compressed handoff"}], require_compression_lease=False)
+
+        assert [msg["content"] for msg in store.load_transcript(child)] == ["compressed handoff"]
+
+    def test_load_transcript_spends_ancestor_observed_rows_once_the_child_has_an_addressed_turn(
+        self, tmp_path, monkeypatch
+    ):
+        import hermes_state
+        monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
+        store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+        parent = "turn_parent"
+        child = "turn_child"
+        store._db.create_session(session_id=parent, source="gateway", model="m")
+        store._db.append_message(session_id=parent, role="user", content="fresh chatter", observed=True)
+        store._db.publish_compression_child(
+            parent_session_id=parent, child_session_id=child, source="gateway",
+            messages=[{"role": "assistant", "content": "compressed handoff"}], require_compression_lease=False)
+        assert [msg["content"] for msg in store.load_transcript(child)] == ["compressed handoff", "fresh chatter"]
+
+        store._db.append_message(session_id=child, role="user", content="addressed child turn")
+
+        assert [msg["content"] for msg in store.load_transcript(child)] == [
+            "compressed handoff", "addressed child turn"]
 
     def test_load_transcript_ignores_non_compression_parent_observed_messages(self, tmp_path, monkeypatch):
         import hermes_state
@@ -452,14 +490,9 @@ class TestLoadTranscriptDBOnly:
                 content=f"observed-{index:03d}",
                 observed=True,
             )
-        store._db.end_session(root, "compression")
-
-        store._db.create_session(
-            session_id=middle,
-            source="gateway",
-            model="m",
-            parent_session_id=root,
-        )
+        store._db.publish_compression_child(
+            parent_session_id=root, child_session_id=middle, source="gateway",
+            messages=[{"role": "assistant", "content": "middle handoff"}], require_compression_lease=False)
         for index in range(root_count, limit + 5):
             store._db.append_message(
                 session_id=middle,
@@ -467,26 +500,18 @@ class TestLoadTranscriptDBOnly:
                 content=f"observed-{index:03d}",
                 observed=True,
             )
-        store._db.end_session(middle, "compression")
-        store._db.create_session(
-            session_id=child,
-            source="gateway",
-            model="m",
-            parent_session_id=middle,
-        )
-        store._db.append_message(
-            session_id=child,
-            role="user",
-            content="current child turn",
-        )
+        store._db.publish_compression_child(
+            parent_session_id=middle, child_session_id=child, source="gateway",
+            messages=[{"role": "assistant", "content": "child handoff"}], require_compression_lease=False)
 
         result = store.load_transcript(child)
 
-        assert [message["content"] for message in result[:-1]] == [
+        # Inverted: the handoff comes first and the capped observed context follows it.
+        assert result[0]["content"] == "child handoff"
+        assert [message["content"] for message in result[1:]] == [
             f"observed-{index:03d}" for index in range(5, limit + 5)
         ]
-        assert len(result[:-1]) == limit
-        assert result[-1]["content"] == "current child turn"
+        assert len(result[1:]) == limit
 
     def test_load_transcript_keeps_observed_context_across_in_place_compaction(
         self, tmp_path, monkeypatch
@@ -498,6 +523,12 @@ class TestLoadTranscriptDBOnly:
         session_id = "in_place_session"
         limit = hermes_state.MAX_OBSERVED_CONTEXT_MESSAGES
         store._db.create_session(session_id=session_id, source="gateway", model="m")
+        # The addressed turn comes first: the observed rows are the pending context for the NEXT one.
+        store._db.append_message(
+            session_id=session_id,
+            role="user",
+            content="ordinary turn",
+        )
         for index in range(limit + 5):
             store._db.append_message(
                 session_id=session_id,
@@ -506,11 +537,6 @@ class TestLoadTranscriptDBOnly:
                 observed=True,
                 platform_message_id=f"tg-{index:03d}",
             )
-        store._db.append_message(
-            session_id=session_id,
-            role="user",
-            content="ordinary turn",
-        )
 
         store._db.archive_and_compact(
             session_id,
@@ -530,16 +556,19 @@ class TestLoadTranscriptDBOnly:
 
         result = store.load_transcript(session_id)
 
-        assert [message["content"] for message in first_result[:-1]] == [
+        # Inverted: the compacted summary leads and the retained observed rows follow it
+        # (they were first, with the summary last, in the original assertions).
+        assert first_result[0]["content"] == "first compacted summary"
+        assert [message["content"] for message in first_result[1:]] == [
             f"observed-{index:03d}" for index in range(5, limit + 5)
         ]
-        assert [message["content"] for message in result[:-1]] == [
+        assert result[0]["content"] == "second compacted summary"
+        assert [message["content"] for message in result[1:]] == [
             f"observed-{index:03d}" for index in range(5, limit + 5)
         ]
-        assert len(result[:-1]) == limit
-        assert result[-1]["content"] == "second compacted summary"
-        assert result[0]["observed"] is True
-        assert result[0]["message_id"] == "tg-005"
+        assert len(result[1:]) == limit
+        assert result[1]["observed"] is True
+        assert result[1]["message_id"] == "tg-005"
 
 
 class TestSessionStoreSwitchSession:
